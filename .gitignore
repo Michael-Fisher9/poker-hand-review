@@ -1,0 +1,11 @@
+# hand histories and everything built from them are regenerated; never commit real ones
+hands/
+coinpoker_*.csv
+coinpoker_*.html
+leak_trainer.html
+_shot.html
+__pycache__/
+.pytest_cache/
+.venv/
+.Rhistory
+.DS_Store

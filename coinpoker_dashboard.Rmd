@@ -1,0 +1,2222 @@
+---
+title: "Hand History Review"
+date: "Generated `r format(Sys.Date(), '%b %d, %Y')`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    css: dashboard.css
+params:
+  hands_csv: "coinpoker_features.csv"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.width = 10, fig.height = 4.2, dpi = 110)
+library(dplyr); library(tidyr); library(ggplot2); library(scales); library(plotly); library(stringr)
+
+green <- "#1f4e79"; red <- "#a8432f"; ink <- "#2b3a42"; grid <- "#e6e9ec"
+theme_set(theme_minimal(base_size = 13) +
+  theme(panel.grid.minor = element_blank(), panel.grid.major = element_line(color = grid),
+        plot.title = element_text(face = "bold", size = 14, color = ink),
+        axis.title = element_text(color = "#6b7780"), legend.title = element_blank()))
+tt <- function(x) paste0(ifelse(x < 0, "-", ""), "$", comma(abs(x), accuracy = 0.01))  # ₮ = USDT ~ $1
+
+# Reusable "layered" bar chart: latest (green) over previous (grey), with the reg/ideal range as a
+# distinct dashed-border band, plus a key. df needs: x, lab, prev, cur, and optional lo/hi (ideal).
+layer_cols <- c("Latest" = green, "Previous" = "#c4ccd1", "Ideal range" = "#dbeafa")
+layered_bars <- function(df, title, ylab = "%", w = 0.62) {
+  has_band <- "lo" %in% names(df) && any(!is.na(df$lo))
+  g <- ggplot(df)
+  if (has_band)
+    g <- g + geom_rect(aes(xmin = x - w/2 - 0.03, xmax = x + w/2 + 0.03, ymin = lo, ymax = hi, fill = "Ideal range"),
+                       color = "#7fa8cf", linetype = "dashed", linewidth = 0.45, alpha = 0.5)
+  g + geom_col(aes(x = x, y = prev, fill = "Previous"), width = w) +
+    geom_col(aes(x = x, y = cur, fill = "Latest"), width = w) +
+    geom_text(aes(x = x, y = prev, label = sprintf("%.1f", prev)), vjust = -0.5, size = 2.7, color = "#7c868c") +
+    geom_text(aes(x = x, y = pmax(cur - 0.6, 0.7), label = sprintf("%.1f", cur)), vjust = 1, size = 3.4,
+              color = "white", fontface = "bold") +
+    scale_fill_manual(name = NULL, values = layer_cols,
+                      breaks = c("Latest", "Previous", "Ideal range"), drop = FALSE) +
+    scale_x_continuous(breaks = df$x, labels = df$lab) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+    labs(title = title, x = NULL, y = ylab) + theme(legend.position = "top")
+}
+
+# Read the ENRICHED feature CSV (starting-hand class, fees, range model, postflop engine,
+# leak/win tags all precomputed in features_coinpoker.R). Self-heal rebuilds it when it's
+# missing, lacks any currently-required column, OR is STALER than the raw hands CSV (so a
+# direct knit after re-parsing can't silently use old features).
+fcsv <- params$hands_csv
+raw_csv <- "coinpoker_hands.csv"
+req_cols <- c("hand169", "range_dir", "in_open_range", "made_river",
+              "river_bluff", "lk_loose_entry", "primary_leak", "win_source")
+dec_csv <- "coinpoker_decisions.csv"
+needs_build <- !file.exists(fcsv) ||
+  !all(req_cols %in% names(read.csv(fcsv, nrows = 1))) ||
+  !file.exists(dec_csv) || file.mtime(dec_csv) < file.mtime(fcsv) ||
+  !("req_implied_x" %in% names(read.csv(dec_csv, nrows = 1))) ||
+  (file.exists(raw_csv) && file.mtime(raw_csv) > file.mtime(fcsv))
+if (needs_build) system2("Rscript", "features_coinpoker.R")
+h <- read.csv(fcsv, stringsAsFactors = FALSE)
+dec <- read.csv(dec_csv, stringsAsFactors = FALSE)   # per-decision value attribution (Tier 1)
+h$dt <- as.POSIXct(h$dt)
+h <- h %>% arrange(dt)
+
+# Presentation-only factors (ordering); the heavy feature engineering now lives upstream.
+pos_lv <- c("EP2", "EP", "UTG", "MP", "HJ", "CO", "BTN", "SB", "BB")
+h$hero_pos <- factor(h$hero_pos, levels = pos_lv[pos_lv %in% h$hero_pos])
+lv <- h %>% distinct(sb, bb) %>% arrange(bb, sb) %>% mutate(s = paste0(sb, "/", bb)) %>% pull(s)
+h$stake <- factor(paste0(h$sb, "/", h$bb), levels = lv)
+cash <- filter(h, !is_bomb)   # exclude bomb pots from skill stats (forced action, no preflop)
+
+bb100   <- function(d) sum(d$net_bb) / nrow(d) * 100
+n_hands <- nrow(h); tot_net <- sum(h$net)
+tot_rake <- sum(h$hero_rake); tot_splash <- sum(h$hero_splash); tot_fees <- sum(h$fees)
+date_lo <- min(as.Date(h$dt)); date_hi <- max(as.Date(h$dt))
+
+# ---- card-review renderer (used by several sections) -----------------------
+# Suit glyphs via HTML entities (dodges the <U+...> string-output bug).
+suit_ent <- c(s = "&spades;", h = "&hearts;", d = "&diams;", c = "&clubs;")
+suit_col <- c(s = "#2b3a42", h = "#a8432f", d = "#a8432f", c = "#2b3a42")
+card_html <- function(card) {
+  if (is.na(card) || card == "") return("")
+  r <- substr(card, 1, 1); s <- substr(card, 2, 2)
+  sprintf('<span class="card" style="color:%s">%s<span class="suit">%s</span></span>', suit_col[s], r, suit_ent[s])
+}
+cards_html <- function(str) {
+  if (is.na(str) || str == "") return('<span class="muted">-</span>')
+  paste(vapply(strsplit(trimws(str), " ")[[1]], card_html, character(1)), collapse = "")
+}
+street_act <- function(bet, call) {
+  if (!is.na(bet) && bet > 0) sprintf('<span class="act-bet">bet %s</span>', tt(bet))
+  else if (!is.na(call) && call > 0) sprintf('<span class="act-call">called %s</span>', tt(call))
+  else '<span class="muted">checked / -</span>'
+}
+default_flag <- function(r) {
+  if (r$river_call > 0 && !is.na(r$sd_cat) && r$sd_cat %in% c("One Pair", "High Card")) "paid off river with a weak hand"
+  else if (r$turn_call > 0 && r$net < 0) "called the turn, lost"
+  else if (is.na(r$sd_cat)) "big pot, no showdown" else "review"
+}
+render_review_cards <- function(df, flagger = default_flag) {
+  for (i in seq_len(nrow(df))) {
+    r <- df[i, ]
+    flag <- flagger(r)
+    lost_to <- if (!is.na(r$villain_cards)) paste0("lost to ", cards_html(r$villain_cards), " (", r$villain_cat, ")") else ""
+    made <- if (!is.na(r$sd_cat)) paste0("you made ", r$sd_cat) else "no showdown"
+    cat(sprintf('<div class="review-hand"><div class="rh-head">%s <span class="rh-meta">%s &middot; %s/%s</span> <span class="rh-net %s">%s</span></div><div class="rh-streets">',
+                cards_html(r$hero_cards), as.character(r$hero_pos), r$sb, r$bb,
+                if (r$net >= 0) "pos" else "neg", tt(r$net)))
+    cat(sprintf('<div class="street"><div class="st-name">Flop</div><div class="st-cards">%s</div><div class="st-act">%s</div></div>',
+                cards_html(r$flop), street_act(r$hero_flop_bet, r$flop_call)))
+    cat(sprintf('<div class="street"><div class="st-name">Turn</div><div class="st-cards">%s</div><div class="st-act">%s</div></div>',
+                cards_html(r$turn_card), street_act(r$hero_turn_bet, r$turn_call)))
+    cat(sprintf('<div class="street"><div class="st-name">River</div><div class="st-cards">%s</div><div class="st-act">%s</div></div>',
+                cards_html(r$river_card), street_act(r$hero_river_bet, r$river_call)))
+    cat(sprintf('</div><div class="rh-foot">%s &middot; %s &middot; <b>%s</b></div></div>', made, lost_to, flag))
+  }
+}
+```
+
+<div class="kpi-row">
+<div class="kpi"><div class="kpi-label">Hands</div><div class="kpi-value">`r comma(n_hands)`</div><div class="kpi-sub">`r format(date_lo, "%b %d")` – `r format(date_hi, "%b %d, %Y")`</div></div>
+<div class="kpi"><div class="kpi-label">Net result</div><div class="kpi-value `r if (tot_net>=0) "pos" else "neg"`">`r tt(tot_net)`</div><div class="kpi-sub">across `r length(unique(h$bb))` stake levels</div></div>
+<div class="kpi"><div class="kpi-label">Win rate</div><div class="kpi-value `r if (bb100(h)>=0) "pos" else "neg"`">`r sprintf("%+.1f", bb100(h))`</div><div class="kpi-sub">bb / 100 hands</div></div>
+<div class="kpi"><div class="kpi-label">VPIP / PFR</div><div class="kpi-value">`r percent(mean(cash$vpip),1)` / `r percent(mean(cash$pfr),1)`</div><div class="kpi-sub">preflop entry / raise</div></div>
+<div class="kpi"><div class="kpi-label">Fees paid</div><div class="kpi-value neg">`r tt(tot_fees)`</div><div class="kpi-sub">rake + splash, `r tt(tot_fees/n_hands)` / hand</div></div>
+</div>
+
+<p class="meta">Hero's view, parsed from CoinPoker text histories. "bb/100" normalizes each hand by its own
+big blind, so mixed stakes are comparable. Bomb pots (`r sum(h$is_bomb)`) are excluded from preflop
+skill stats (no normal preflop action).</p>
+
+# Progress tracker
+
+Where your game is **right now** and whether it's moving the right way. Each point is a **day of
+play** (computed fresh from de-duplicated hands, so overlapping or multi-day uploads can't double-count).
+Days under 50 hands are dropped as too noisy. The table compares your **latest day** to the
+**previous day** against a winning 6-max reg's range.
+
+```{r progress-calc}
+snaps <- tryCatch(read.csv("coinpoker_snapshots.csv", stringsAsFactors = FALSE), error = function(e) NULL)
+if (!is.null(snaps)) { snaps$date <- as.Date(snaps$date); snaps <- snaps[snaps$n >= 50, , drop = FALSE]
+                       snaps <- snaps[order(snaps$date), ] }
+has_snaps <- !is.null(snaps) && nrow(snaps) >= 2
+if (has_snaps) {
+  cur <- snaps[nrow(snaps), ]; prv <- snaps[nrow(snaps) - 1, ]
+  bands <- list(vpip = c(22, 27), pfr = c(18, 22), threebet = c(7, 12), cbet = c(50, 65),
+                fold_to_cbet = c(40, 55), af = c(2, 3.5), wtsd = c(24, 28))
+  labs <- c(vpip = "VPIP %", pfr = "PFR %", threebet = "3-bet %", cbet = "C-bet %",
+            fold_to_cbet = "Fold to c-bet %", af = "Postflop AF", wtsd = "WTSD %")
+  bstatus <- function(v, b) if (v < b[1]) "below" else if (v > b[2]) "above" else "in band"
+  bdist <- function(v, b) if (v < b[1]) b[1] - v else if (v > b[2]) v - b[2] else 0
+  # warnings/focus use only the high-sample preflop stats (every hand) -- per-day postflop
+  # rates (c-bet, fold-to-cbet, AF, WTSD) are too noisy on a single day to flag.
+  stable <- c("vpip", "pfr", "threebet")
+}
+```
+
+<p class="meta">`r if (has_snaps) sprintf("Latest day: %s (%d hands) vs previous: %s (%d hands).", format(cur$date, "%b %d"), cur$n, format(prv$date, "%b %d"), prv$n) else "Need two 50+ hand days for trends."`</p>
+
+```{r trend-table, eval=has_snaps}
+tr <- do.call(rbind, lapply(names(bands), function(k) {
+  b <- bands[[k]]; cv <- cur[[k]]; pv <- prv[[k]]; d <- cv - pv
+  data.frame(Stat = labs[k], `Latest day` = cv, `Prev day` = pv, `Change` = sprintf("%+.1f", d),
+             `Reg range` = paste0(b[1], "-", b[2]), `Status` = bstatus(cv, b), check.names = FALSE)
+}))
+knitr::kable(tr, align = "lrrrrl", row.names = FALSE)
+```
+
+```{r warnings, eval=has_snaps, results='asis'}
+w <- character(0)
+for (k in stable) {
+  b <- bands[[k]]; cv <- cur[[k]]; pv <- prv[[k]]; st <- bstatus(cv, b)
+  if (st != "in band")
+    w <- c(w, sprintf("<b>%s</b> is %s the reg range (%.1f vs %d-%d)", labs[k], st, cv, b[1], b[2]))
+  if (bdist(cv, b) > bdist(pv, b) + 1.5)
+    w <- c(w, sprintf("<b>%s</b> drifted <span class='down'>away from target</span> (%.1f, was %.1f)", labs[k], cv, pv))
+  if (bdist(pv, b) > 0 && bdist(cv, b) == 0)
+    w <- c(w, sprintf("<b>%s</b> came back <span class='up'>into range</span> (%.1f) - keep it.", labs[k], cv))
+}
+if (length(w)) {
+  cat('<div class="warn"><div class="warn-title">Watch &amp; wins (latest day)</div><ul>')
+  for (x in unique(w)) cat(paste0("<li>", x, "</li>"))
+  cat('</ul></div>')
+} else cat('<div class="ok">All key tendencies are inside the reg range on your latest day. Solid.</div>')
+```
+
+```{r focus, eval=has_snaps, results='asis'}
+ds <- sapply(stable, function(k) bdist(cur[[k]], bands[[k]]))
+worst <- names(which.max(ds))
+foc <- if (max(ds) > 0) {
+  sprintf("Pull <b>%s</b> toward range - it's the furthest off (now %.1f, target %d-%d).",
+          labs[worst], cur[[worst]], bands[[worst]][1], bands[[worst]][2])
+} else {
+  "Tendencies are dialed in - shift focus to postflop discipline: fold one pair / busted draws to big turn-river bets, and bet your IP spots instead of calling."
+}
+cat(paste0('<div class="focus"><div class="focus-title">Focus for the next ~3 days</div>', foc,
+           '<div class="focus-sub">Re-checks automatically the next time new hands are parsed.</div></div>'))
+```
+
+### Latest day vs previous
+
+**Key:** dark blue = your **latest day**, grey behind = the **previous day** (a blue bar shorter than the
+grey cap means the stat came down), dashed blue band = the **ideal reg range**.
+
+```{r trend-bars, eval=has_snaps, fig.height=3.4}
+key <- c("vpip", "pfr", "threebet")
+td <- data.frame(x = seq_along(key), lab = unname(labs[key]),
+                 prev = as.numeric(prv[key]), cur = as.numeric(cur[key]),
+                 lo = sapply(key, function(k) bands[[k]][1]), hi = sapply(key, function(k) bands[[k]][2]))
+layered_bars(td, "VPIP / PFR / 3-bet: latest day vs previous, vs ideal range")
+```
+
+Below, the same three tendencies **plus bb/100 (your actual win rate)** across your sessions. Points
+are spaced **evenly by session, not by calendar date** (the date is in the hover) - so a month-long
+break doesn't stretch into a misleading flat line. VPIP / PFR / 3-bet read off the **left** axis;
+**bb/100 rides the right axis** (its own scale, since a day's win rate swings far wider than a percent
+stat). Heads-up: one-day bb/100 is noisy - read its *direction over several sessions*, not any single point.
+
+```{r trend-line, eval=has_snaps}
+sl <- snaps; sl$idx <- seq_len(nrow(sl)); sl$dlab <- format(sl$date, "%b %d")
+c_vpip <- "#9aa7b0"; c_pfr <- green; c_3bet <- ink; c_bb <- "#b98a3e"   # bb/100 = amber, its own axis
+line_series <- function(p, yv, nm, col, dash = "solid", axis = "y") {
+  add_trace(p, y = yv, name = nm, yaxis = axis, type = "scatter", mode = "lines+markers",
+            line = list(color = col, width = 2.2, dash = dash), marker = list(color = col, size = 6),
+            text = sl$dlab, hovertemplate = paste0("%{text}<br>", nm, ": %{y:.1f}<extra></extra>"))
+}
+plot_ly(sl, x = ~idx, height = 360) %>%
+  line_series(~vpip,     "VPIP %",  c_vpip) %>%
+  line_series(~pfr,      "PFR %",   c_pfr) %>%
+  line_series(~threebet, "3-bet %", c_3bet) %>%
+  line_series(~bb100,    "bb/100",  c_bb, dash = "dot", axis = "y2") %>%
+  layout(title = list(text = "Key tendencies by session (evenly spaced; date in hover)",
+                      font = list(size = 15, color = ink), x = 0.02),
+         xaxis = list(title = "", tickmode = "array", tickvals = sl$idx, ticktext = sl$dlab,
+                      tickangle = -40, tickfont = list(size = 10)),
+         yaxis  = list(title = "VPIP / PFR / 3-bet (%)", rangemode = "tozero", zeroline = FALSE),
+         yaxis2 = list(title = "bb/100", overlaying = "y", side = "right", showgrid = FALSE,
+                       zeroline = TRUE, zerolinecolor = "#c9ced3", zerolinewidth = 1),
+         legend = list(orientation = "h", x = 0, y = 1.12),
+         hovermode = "x unified", margin = list(r = 62, t = 54))
+```
+
+By position, did the tightening land everywhere or just a few seats? Same key, with rough positional
+VPIP targets as the band (blinds defend wide, so their ideal is broad). Seats under 15 hands/day dropped.
+
+```{r pos-trend, eval=has_snaps, fig.height=3.4}
+vpip_ideal <- list(UTG = c(15, 20), MP = c(17, 22), HJ = c(18, 24), CO = c(23, 29),
+                   BTN = c(40, 48), SB = c(28, 40), BB = c(30, 46), EP = c(14, 19), EP2 = c(13, 18))
+dprev <- snaps$date[nrow(snaps) - 1]; dcur <- snaps$date[nrow(snaps)]
+pv_pos <- cash %>% filter(as.Date(dt) == dprev) %>% group_by(hero_pos) %>% summarise(prev = mean(vpip) * 100, np = n(), .groups = "drop")
+cv_pos <- cash %>% filter(as.Date(dt) == dcur) %>% group_by(hero_pos) %>% summarise(cur = mean(vpip) * 100, nc = n(), .groups = "drop")
+pt <- full_join(pv_pos, cv_pos, by = "hero_pos") %>%
+  filter(!is.na(hero_pos), coalesce(np, 0) >= 15, coalesce(nc, 0) >= 15)
+pt$hero_pos <- factor(pt$hero_pos, levels = pos_lv[pos_lv %in% pt$hero_pos])
+pt <- pt %>% arrange(hero_pos) %>% mutate(x = row_number(), lab = as.character(hero_pos),
+         lo = sapply(lab, function(p) vpip_ideal[[p]][1]), hi = sapply(lab, function(p) vpip_ideal[[p]][2]))
+layered_bars(pt, "VPIP by position: latest day vs previous, vs ideal", ylab = "VPIP %")
+```
+
+### Costliest hands from the latest day
+
+The costliest hands from your most recent day — laid out street by street with the board and your
+action, so you can replay the decision. The flag is a guess at the leak.
+
+```{r sus-hands, eval=has_snaps, results='asis'}
+last_day <- max(snaps$date)
+render_review_cards(cash %>% filter(as.Date(dt) == last_day) %>% arrange(net) %>% head(5))
+```
+
+## Results by stake
+
+The same stats split by stake, with bb/100 at each level.
+
+```{r by-stake}
+bs <- cash %>% group_by(Stake = stake) %>%
+  summarise(Hands = n(), `Net` = tt(sum(net)), `bb/100` = sprintf("%+.1f", sum(net_bb)/n()*100),
+            VPIP = percent(mean(vpip), 1), PFR = percent(mean(pfr), 1), .groups = "drop")
+knitr::kable(bs, align = "lrrrrr")
+```
+
+```{r by-stake-chart, fig.height=3.6}
+bsc <- cash %>% group_by(stake) %>% summarise(bb100 = sum(net_bb)/n()*100, hands = n(), .groups = "drop")
+ggplot(bsc, aes(stake, bb100, fill = bb100 >= 0)) +
+  geom_col(width = 0.6) + geom_hline(yintercept = 0, color = ink) +
+  geom_text(aes(label = sprintf("%+.1f (n=%d)", bb100, hands)), vjust = ifelse(bsc$bb100 >= 0, -0.4, 1.2), size = 3.4) +
+  scale_fill_manual(values = c(`TRUE` = green, `FALSE` = red), guide = "none") +
+  labs(title = "Win rate by stake (bb / 100 hands)", x = NULL, y = "bb/100")
+```
+
+## Results by table
+
+A quirk worth exploiting: CoinPoker's `table_id` isn't a one-off seating, it's a **persistent lobby
+identity**: a table name recurs across many sessions, and each one hosts exactly one stake (no
+mixing). So **table-level** history needs no player profiling at all; it's a direct readout of
+Hero's own results at a specific, revisitable table. Standalone + wired into every
+render (`table_ecology.R`).
+
+```{r te-load}
+te <- tryCatch(read.csv("coinpoker_table_ecology.csv", stringsAsFactors = FALSE), error = function(e) NULL)
+```
+
+```{r te-table, eval=!is.null(te)}
+tt2 <- te %>% transmute(Table = table_id, Stake = stake, Hands = n_hands, `Avg players` = avg_players,
+  `Hero VPIP` = percent(hero_vpip, 1), `Avg pot (bb, postflop)` = avg_pot_bb,
+  `Multiway rate` = percent(multiway_rate, 1), Net = tt(net), `bb/100` = sprintf("%+.1f", bb100))
+knitr::kable(tt2, align = "lccccccrr", caption = sprintf("Every table with >=30 hands (%d of %d total tables)", nrow(te), length(unique(h$table_id))))
+```
+
+```{r te-note, results='asis', eval=!is.null(te)}
+big <- te[which.max(te$n_hands), ]
+cat(sprintf('<p class="meta">Table <b>%s</b> alone accounts for <b>%s of all hands</b> in this dashboard (%d of them) and has been a <b>%s bb/100</b> venue (%s) &mdash; the single biggest venue. The avg-players-seated column has the strongest (if still small-sample, n=%d tables) relationship with results here: fuller tables have tended to run worse for Hero. Treat the correlation numbers printed by <code>table_ecology.R</code> as a hypothesis to keep watching, not a proven seat-selection rule at this sample size &mdash; but the per-table ranking itself is a direct, actionable readout: these are specific, revisitable tables, not anonymous one-off seatings.</p>',
+  big$table_id, percent(big$n_hands / sum(te$n_hands), 1), big$n_hands,
+  sprintf("%+.1f", big$bb100), tt(big$net), nrow(te)))
+```
+
+```{r te-missing, results='asis', eval=is.null(te)}
+cat('<p class="meta">No <code>coinpoker_table_ecology.csv</code> found &mdash; run <code>Rscript table_ecology.R</code> (render does this automatically).</p>')
+```
+
+## Bankroll over time (in big blinds)
+
+Cumulative bb (stake-normalized), so a swing at 50NL doesn't dwarf the rest. The x-axis is **hands played**,
+not calendar date, so breaks between sessions don't stretch into long flat lines. Drag to zoom.
+
+```{r bankroll, fig.height=4}
+cb <- h %>% arrange(dt) %>% mutate(idx = row_number(), cum = cumsum(net_bb),
+            text = paste0("hand ", idx, "<br>", format(dt, "%b %d %H:%M"), "<br>", stake, "<br>cum: ", round(cum), " bb"))
+plot_ly(cb, x = ~idx, y = ~cum, type = "scatter", mode = "lines", line = list(color = green, width = 1.5),
+        hoverinfo = "text", text = ~text, height = 360) %>%
+  layout(xaxis = list(title = "hands played", gridcolor = grid),
+         yaxis = list(title = "cumulative bb", gridcolor = grid, zeroline = TRUE, zerolinecolor = ink),
+         margin = list(t = 20)) %>%
+  config(displaylogo = FALSE, modeBarButtonsToRemove = c("select2d", "lasso2d", "autoScale2d"))
+```
+
+## Luck ledger for the deepest drawdown
+
+Every downswing raises the same question: cards, bad beats, or leaks? This splits the answer into
+three honestly-scoped luck components plus a residual, instead of one vague "variance" verdict.
+**Card luck** = raw equity of the hands you were dealt vs a random hand (no board, no villain read —
+purely "were your cards better or worse than usual"), monetized off your own full-sample regression.
+**All-in luck** = equity at clean all-ins with cards to come vs what you actually collected.
+**River-card luck** = for hands that reached a heads-up showdown street-by-street (not all-in), equity
+right before the river card fell vs the actual result — did that one card flip who was ahead. Whatever
+is left over is the **residual**: your decisions plus variance the other three don't touch. Standalone
+tool (`python3 luck_ledger.py`, ~2-3 min) — not run on every render; DATA_DICTIONARY §10 has
+the exact formulas and caveats.
+
+```{r ll-load}
+ll <- tryCatch(read.csv("coinpoker_luck_ledger.csv", stringsAsFactors = FALSE), error = function(e) NULL)
+ll_ok <- !is.null(ll) && "downswing" %in% ll$window
+```
+
+```{r ll-chart, eval=ll_ok, fig.height=4.2}
+lab <- c(card_luck = "Card luck", allin_luck = "All-in luck", river_card_luck = "River-card luck",
+         residual = "Residual\n(decisions + other)", actual_net = "Actual net")
+ord <- names(lab)
+w <- ll[ll$window == "downswing", ]
+w <- w[match(ord, w$component), ]
+n_hands <- w$n_hands[w$component == "actual_net"]
+
+plot_ly(w, x = unname(lab[w$component]), y = ~dollars, type = "waterfall",
+        measure = c("relative", "relative", "relative", "relative", "total"),
+        text = ~tt(dollars), textposition = "outside",
+        increasing = list(marker = list(color = green)),
+        decreasing = list(marker = list(color = red)),
+        totals = list(marker = list(color = ink)),
+        connector = list(line = list(color = grid)), height = 380) %>%
+  layout(title = list(text = sprintf("Downswing decomposition since Jun 18 (%d hands)", n_hands), font = list(size = 14)),
+         yaxis = list(title = "$", gridcolor = grid, zeroline = TRUE, zerolinecolor = ink),
+         xaxis = list(title = NULL), margin = list(t = 40)) %>%
+  config(displaylogo = FALSE, modeBarButtonsToRemove = c("select2d", "lasso2d", "autoScale2d"))
+```
+
+```{r ll-note, results='asis', eval=ll_ok}
+d <- setNames(w$dollars, w$component)
+badbeat <- d["allin_luck"] + d["river_card_luck"]
+share <- function(x) percent(abs(x) / sum(abs(d[c("card_luck","allin_luck","river_card_luck","residual")])), 1)
+cat(sprintf('<p class="meta">Window result: <b>%s</b>. Card luck is %s (%s). All-in luck (%s) and river-card luck (%s) together come to <b>%s</b>, about %s of the total swing. The <b>residual is %s</b>, about %s: decisions plus everything the model can&rsquo;t see, not automatically leaks (the leak ledger below gives the named-leak view of the same money).</p>',
+  tt(d["actual_net"]),
+  tt(d["card_luck"]), ifelse(abs(d["card_luck"]) < 20, "close to an average mix of hands", "a real departure from an average mix"),
+  tt(d["allin_luck"]), tt(d["river_card_luck"]), tt(badbeat), share(badbeat),
+  tt(d["residual"]), share(d["residual"])))
+```
+
+```{r ll-missing, results='asis', eval=!ll_ok}
+cat('<p class="meta">No <code>coinpoker_luck_ledger.csv</code> found (or no downswing-window rows) &mdash; run <code>python3 luck_ledger.py</code> from the repo root to generate it (~2-3 min).</p>')
+```
+
+## Downswing simulator and win-rate estimate
+
+Three questions on the same per-hand results, each carrying its own honest uncertainty instead of
+one point estimate. DATA_DICTIONARY §11 has the exact methods and caveats. Standalone + wired into
+every render (`downswing_sim.R`, ~2s).
+
+```{r ds-load}
+dd_sum <- tryCatch(read.csv("coinpoker_downswing_sim.csv", stringsAsFactors = FALSE), error = function(e) NULL)
+dd_boot <- tryCatch(read.csv("coinpoker_bootstrap_dd.csv", stringsAsFactors = FALSE), error = function(e) NULL)
+wr_post <- tryCatch(read.csv("coinpoker_winrate_posterior.csv", stringsAsFactors = FALSE), error = function(e) NULL)
+wr_post_rb <- tryCatch(read.csv("coinpoker_winrate_posterior_rakeback.csv", stringsAsFactors = FALSE), error = function(e) NULL)
+ror <- tryCatch(read.csv("coinpoker_risk_of_ruin.csv", stringsAsFactors = FALSE), error = function(e) NULL)
+ds_ok <- !is.null(dd_sum) && !is.null(dd_boot) && !is.null(wr_post) && !is.null(ror)
+has_rb_posterior <- !is.null(wr_post_rb)
+```
+
+### 1. Worst drawdown against simulated careers
+
+```{r ds-dd-chart, eval=ds_ok, fig.height=3.8}
+plot_ly(dd_boot, x = ~sim_dd_bb, type = "histogram", height = 320,
+        marker = list(color = "#c4ccd1", line = list(color = "white", width = 0.5))) %>%
+  layout(title = list(text = sprintf("5,000 simulated careers, same length as yours (%s hands)", comma(dd_sum$n_hands)), font = list(size = 13)),
+         xaxis = list(title = "worst peak-to-trough drawdown (bb)", gridcolor = grid),
+         yaxis = list(title = "simulated careers", gridcolor = grid),
+         shapes = list(list(type = "line", x0 = dd_sum$actual_dd_bb, x1 = dd_sum$actual_dd_bb,
+                             y0 = 0, y1 = 1, yref = "paper", line = list(color = red, width = 2, dash = "dash"))),
+         annotations = list(list(x = dd_sum$actual_dd_bb, y = 1, yref = "paper", yanchor = "bottom",
+                                  showarrow = FALSE, text = "your actual worst swing", font = list(color = red, size = 11))),
+         margin = list(t = 40)) %>%
+  config(displaylogo = FALSE, modeBarButtonsToRemove = c("select2d", "lasso2d", "autoScale2d"))
+```
+
+```{r ds-dd-note, results='asis', eval=ds_ok}
+cat(sprintf('<p class="meta">Your worst drawdown so far is <b>%.0f bb</b>. Resampling your own per-hand results (order scrambled, same total volume) %.0f%% of simulated careers hit a swing at least that bad %s the median simulated worst swing is %.0f bb. %s</p>',
+  dd_sum$actual_dd_bb, 100 * dd_sum$percentile,
+  ifelse(dd_sum$percentile > 0.3, "purely by chance &mdash;", "&mdash; only"),
+  dd_sum$median_sim_dd_bb,
+  ifelse(dd_sum$percentile > 0.3,
+    "In other words: a downswing this size is <b>not statistically remarkable</b> for a player with your exact variance profile, even with zero behavioral change.",
+    "That's a comparatively uncommon swing for your own return distribution &mdash; still explainable by variance, but on the unlucky side of it.")))
+```
+
+### 2. Posterior win rate by stake
+
+```{r ds-post-table, eval=ds_ok}
+pt <- wr_post %>% transmute(Stake = stake, Hands = n, `Raw bb/100` = sprintf("%+.1f", raw_bb100),
+  `Posterior bb/100 (95% CI)` = sprintf("%+.1f  [%+.1f, %+.1f]", post_bb100, ci_lo, ci_hi),
+  `P(true winner)` = percent(p_winner, 1))
+knitr::kable(pt, align = "lrrrr",
+  caption = "Bayesian posterior on true winrate, skeptical prior: normal, mean 0, SD 8 bb/100 (rake, no rakeback)")
+```
+
+```{r ds-post-table-rb, eval=ds_ok && has_rb_posterior}
+pt_rb <- wr_post_rb %>% transmute(Stake = stake, Hands = n, `Raw bb/100` = sprintf("%+.1f", raw_bb100),
+  `Posterior bb/100 (95% CI)` = sprintf("%+.1f  [%+.1f, %+.1f]", post_bb100, ci_lo, ci_hi),
+  `P(true winner)` = percent(p_winner, 1))
+knitr::kable(pt_rb, align = "lrrrr",
+  caption = "Same posterior, WITH rakeback modeled in (see Rake & rakeback section for how)")
+```
+
+```{r ds-post-note, results='asis', eval=ds_ok}
+ov <- wr_post[wr_post$stake == "overall", ]
+verdict <- if (ov$p_winner < 0.2) {
+  "probably not beating these games overall yet"
+} else if (ov$p_winner < 0.5) {
+  "unclear, more likely losing than winning"
+} else if (ov$p_winner < 0.8) {
+  "leaning toward a long-run winner, with a wide interval"
+} else {
+  "likely a long-run winner"
+}
+rb_line <- if (has_rb_posterior) {
+  ov_rb <- wr_post_rb[wr_post_rb$stake == "overall", ]
+  sprintf(' With rakeback folded in (below), P(winner) moves from %s to %s.',
+          percent(ov$p_winner, 1), percent(ov_rb$p_winner, 1))
+} else ""
+cat(sprintf('<p class="meta"><b>Overall: %s</b> (P(true win rate &gt; 0) = %s, under a prior that assumes break-even until shown otherwise). The raw win rate and the posterior differ because the prior shrinks noisy estimates toward zero; per stake, the intervals show how far each estimate can move.%s</p>',
+  verdict, percent(ov$p_winner, 1), rb_line))
+```
+
+### 3. Bankroll consequence: risk of ruin
+
+```{r ds-ror-chart, eval=ds_ok, fig.height=3.8}
+ror_cols <- c("pessimistic (CI low)" = red, "central (posterior mean)" = ink, "optimistic (CI high)" = green, "central + rakeback" = "#d9c48f")
+plot_ly(ror, x = ~buyins, y = ~ror_pct, color = ~scenario, colors = ror_cols,
+        type = "scatter", mode = "lines+markers", height = 340,
+        hovertemplate = "%{y:.1f}% ruin at %{x} buy-ins<extra>%{fullData.name}</extra>") %>%
+  layout(title = list(text = "Risk of ruin vs bankroll size, at three winrate scenarios", font = list(size = 13)),
+         xaxis = list(title = "bankroll (100bb buy-ins)", gridcolor = grid),
+         yaxis = list(title = "risk of ruin (%)", gridcolor = grid, range = c(0, 105)),
+         legend = list(orientation = "h", y = -0.25), margin = list(t = 40)) %>%
+  config(displaylogo = FALSE, modeBarButtonsToRemove = c("select2d", "lasso2d", "autoScale2d"))
+```
+
+```{r ds-ror-note, results='asis', eval=ds_ok}
+under5 <- function(sc) {
+  r <- ror[ror$scenario == sc & ror$ror_pct <= 5, ]
+  if (nrow(r)) paste0("~", min(r$buyins), " buy-ins") else "none of the bankrolls shown"
+}
+cat(sprintf('<p class="meta">Bankroll needed for under 5%% risk of ruin: %s at the posterior mean, %s at the pessimistic end of the interval, %s at the optimistic end. At a win rate of zero or below, the ruin model says any finite bankroll eventually busts, which is its way of saying the edge isn&rsquo;t established.</p>',
+  under5("central (posterior mean)"), under5("pessimistic (CI low)"), under5("optimistic (CI high)")))
+```
+
+```{r ds-missing, results='asis', eval=!ds_ok}
+cat('<p class="meta">No downswing-simulator output found &mdash; run <code>Rscript downswing_sim.R</code> (render does this automatically).</p>')
+```
+
+## Recent form
+
+Career averages move slowly, so a change in how you're playing *right now* hides in the pile.
+This isolates your latest sessions so adjustments show up fast. (Sessions that run past midnight
+land on the next calendar day.)
+
+```{r recent-form}
+recent <- cash %>% mutate(Day = as.Date(dt)) %>% group_by(Day) %>%
+  summarise(Hands = n(), VPIP = percent(mean(vpip), 1), PFR = percent(mean(pfr), 1),
+            `3-bet` = percent(sum(three_bet) / pmax(sum(vsopen_opp), 1), 1),
+            `bb/100` = sprintf("%+.1f", sum(net_bb)/n()*100), Net = tt(sum(net)),
+            Stakes = paste(sort(unique(paste0(sb, "/", bb))), collapse = ", "), .groups = "drop") %>%
+  arrange(desc(Day)) %>% head(8)
+knitr::kable(recent, align = "lrrrrrrl")
+```
+
+```{r rolling-style, fig.height=3.6}
+co <- cash %>% arrange(dt); k <- 300
+roll <- function(x) as.numeric(stats::filter(x, rep(1/k, k), sides = 1))
+co$rv <- roll(co$vpip); co$rp <- roll(co$pfr); co$idx <- seq_len(nrow(co))
+rr <- co %>% filter(!is.na(rv)) %>% transmute(idx, VPIP = rv, PFR = rp) %>%
+  pivot_longer(c(VPIP, PFR))
+ggplot(rr, aes(idx, value, color = name)) + geom_line(linewidth = 0.8) +
+  scale_color_manual(values = c(VPIP = "#9aa7b0", PFR = green)) +
+  scale_y_continuous(labels = percent) +
+  labs(title = sprintf("Rolling VPIP / PFR (%d-hand moving average)", k),
+       x = "hand # (chronological)", y = NULL)
+```
+
+> The career line is the average of everything; the **right edge of this chart is who you are
+> now**. A falling VPIP with a steady-or-rising PFR is a tightening, more-aggressive adjustment —
+> the direction the scorecard wants. Watch that the change *sticks* over the next few sessions
+> rather than snapping back.
+
+## Positional analysis
+
+The core of any hand review. Below: how often you enter (VPIP) and raise (PFR) by seat, and
+your win rate there. Late positions should be looser and more profitable; the blinds lose
+(they post dead money) — the question is *how much*.
+
+```{r position-stats}
+ps <- cash %>% group_by(Position = hero_pos) %>%
+  summarise(Hands = n(), VPIP = percent(mean(vpip), 1), PFR = percent(mean(pfr), 1),
+            `bb/100` = sprintf("%+.1f", sum(net_bb)/n()*100), Net = tt(sum(net)), .groups = "drop")
+knitr::kable(ps, align = "lrrrrr")
+```
+
+```{r position-chart, fig.height=3.8}
+pc <- cash %>% group_by(hero_pos) %>% summarise(bb100 = sum(net_bb)/n()*100, .groups = "drop")
+ggplot(pc, aes(hero_pos, bb100, fill = bb100 >= 0)) +
+  geom_col(width = 0.7) + geom_hline(yintercept = 0, color = ink) +
+  scale_fill_manual(values = c(`TRUE` = green, `FALSE` = red), guide = "none") +
+  labs(title = "Win rate by position (bb/100)", x = NULL, y = "bb/100")
+```
+
+```{r vpip-pfr-chart, fig.height=3.6}
+vp <- cash %>% group_by(hero_pos) %>%
+  summarise(VPIP = mean(vpip), PFR = mean(pfr), .groups = "drop") %>%
+  pivot_longer(c(VPIP, PFR))
+ggplot(vp, aes(hero_pos, value, fill = name)) +
+  geom_col(position = "dodge", width = 0.7) +
+  scale_fill_manual(values = c(VPIP = "#9aa7b0", PFR = green)) +
+  scale_y_continuous(labels = percent) +
+  labs(title = "Preflop entry (VPIP) and raise (PFR) by position", x = NULL, y = NULL)
+```
+
+> A healthy 6-max preflop game tightens from the blinds/early seats to the button. Watch for
+> a VPIP that's too flat across positions (playing too many hands up front) or blinds that
+> bleed far more than the ~ −30 to −50 bb/100 that posting dead money costs.
+
+### Preflop aggression by position
+
+The decisions that drive most of your winrate: how often you **open** (raise first in), how
+often you **3-bet** a raiser, and how often you **fold to a 3-bet** after opening.
+
+```{r preflop-position}
+pf <- cash %>% group_by(Position = hero_pos) %>%
+  summarise(Hands = n(),
+            `Open-raise %`   = percent(sum(open_raise)   / pmax(sum(rfi_opp), 1), 1),
+            `3-bet %`        = percent(sum(three_bet)    / pmax(sum(vsopen_opp), 1), 1),
+            `Fold to 3-bet %`= percent(sum(fold_to_3bet) / pmax(sum(ftb_opp), 1), 1),
+            `(3-bet n)` = sum(vsopen_opp), .groups = "drop")
+knitr::kable(pf, align = "lrrrrr")
+```
+
+```{r preflop-chart, fig.height=3.6}
+pfl <- cash %>% group_by(hero_pos) %>%
+  summarise(`Open-raise` = sum(open_raise) / pmax(sum(rfi_opp), 1),
+            `3-bet`       = sum(three_bet) / pmax(sum(vsopen_opp), 1), .groups = "drop") %>%
+  pivot_longer(c(`Open-raise`, `3-bet`))
+ggplot(pfl, aes(hero_pos, value, fill = name)) +
+  geom_col(position = "dodge", width = 0.7) +
+  scale_fill_manual(values = c(`Open-raise` = green, `3-bet` = ink)) +
+  scale_y_continuous(labels = percent) +
+  labs(title = "Open-raise and 3-bet frequency by position", x = NULL, y = NULL)
+```
+
+> Benchmarks (reg, 6-max): open-raise rises from ~18% UTG to ~45%+ on the button; 3-bet ~7–9%
+> overall, higher from the blinds and button; fold-to-3-bet ~40–55%. **Note the small 3-bet/
+> fold-to-3-bet samples** — these stabilize as you add hands. Reading them now: directionally,
+> are you opening too tight late or never 3-betting light?
+
+## Out-of-range hands and their results
+
+You can see *where* your stats sit and *how they move* - but not whether being off-range actually
+costs you. We can't prove "high VPIP caused that loss" (variance is too loud for that). What we **can**
+do is take the specific hands that pushed a stat out of range and show how they really turned out -
+forked by stat. Anecdotal, but it puts dollars next to the numbers.
+
+To do that, each voluntary hand is tagged against a **per-position opening range** (a standard 6-max
+chart by hand strength - tight UTG, wide on the button, blinds defend loose):
+
+- **Loose** - you voluntarily played a hand *outside* your seat's range (this is what inflates VPIP).
+- **Passed** - it folded to you first-in and you folded a hand that *is* in your range (too tight - the steal you skipped).
+- **In** - a standard, in-range voluntary hand.
+
+<div class="warn"><div class="warn-title">How to read this (a v1 heuristic)</div>
+The range is a positional baseline from a hand-strength formula (Chen, with a set-mining bump for
+small pairs). It knows "should I generally play this hand from this seat" but <b>not</b> the full
+facing-action picture yet (opening vs. flatting a raise vs. 3-betting vs. defending a blind are
+different ranges). So treat the buckets as directional, not gospel - and the per-position widths are
+yours to tune in <code>features_coinpoker.R</code> (<code>POS_OPEN</code>).</div>
+
+### Results by entry type
+
+```{r fork-summary}
+bk <- function(d, label) data.frame(Bucket = label, Hands = nrow(d), Net = tt(sum(d$net)),
+  `bb/100` = sprintf("%+.1f", bb100(d)), `Win %` = percent(mean(d$net > 0), 1), check.names = FALSE)
+fork <- rbind(
+  bk(filter(cash, range_dir == "in"),    "VPIP - in-range entries (baseline)"),
+  bk(filter(cash, range_dir == "loose"), "VPIP - LOOSE entries (out of range)"),
+  bk(filter(cash, open_raise == 1),      "PFR - opens (raise first in)"),
+  bk(filter(cash, three_bet == 1),       "3-bet - your 3-bets"))
+knitr::kable(fork, align = "lrrrr", row.names = FALSE)
+```
+
+> The fork that matters: your **loose entries** vs everything else. The two aggression buckets (opens,
+> 3-bets) are where your edge should live - if those print and the loose entries bleed, the read is
+> "keep the aggression, tighten the junk." A hand can sit in more than one row (you can open a loose
+> hand), so this is three lenses, not a clean split.
+
+### 3-bets: where the profit comes from
+
+Where 3-bet profit comes from decides how far to trust it. A 3-bet earns two ways: villains **fold now** (clean, low-variance fold equity) or you **win
+postflop** (real, but swingy). The split:
+
+```{r tb-street}
+tb <- filter(cash, three_bet == 1)
+seg <- function(d, l) data.frame(Segment = l, Hands = nrow(d), Net = tt(sum(d$net)),
+  `bb/100` = sprintf("%+.1f", bb100(d)), check.names = FALSE)
+ts <- rbind(
+  seg(filter(tb, !saw_flop & net > 0),  "Won preflop - villain folded (clean)"),
+  seg(filter(tb, !saw_flop & net <= 0), "Folded to a 4-bet (cost)"),
+  seg(filter(tb, saw_flop),             "Saw a flop - won/lost postflop (swingy)"))
+knitr::kable(ts, align = "lrrr", row.names = FALSE)
+```
+
+```{r tb-foldout, include=FALSE}
+tb_fold <- 100 * mean(!tb$saw_flop)
+op_fold <- 100 * mean(!cash$saw_flop[cash$open_raise == 1])
+```
+
+<p class="meta">`r sprintf("3-bets take the pot preflop %.0f%% of the time; opens steal %.0f%%. %s of the %s total 3-bet result was earned postflop, across %d hands.", tb_fold, op_fold, tt(sum(tb$net[tb$saw_flop])), tt(sum(tb$net)), sum(tb$saw_flop))`</p>
+
+> Fold-equity profit is reliable; postflop profit is high-variance and can regress. If most of the
+> 3-bet profit is postflop, treat it as provisional. Against opponents who call 3-bets light, the
+> standard adjustment is to value-3-bet bigger and bluff-3-bet less.
+
+### 3-bets by opener position and size
+
+Against a **tighter** opener you're 3-betting into a stronger range; sizing controls how much fold
+equity you actually buy. Samples are ~50-75 per opener and thin once split by size - read as directional.
+
+```{r tb-pos}
+vp <- tb %>% filter(!is.na(vsopen_pos)) %>%
+  group_by(`Opener` = factor(vsopen_pos, levels = pos_lv)) %>%
+  summarise(`Your 3-bets` = n(), Net = tt(sum(net)), `bb/100` = sprintf("%+.1f", sum(net_bb) / n() * 100),
+            `Won preflop` = percent(mean(!saw_flop & net > 0), 1), .groups = "drop") %>%
+  filter(`Your 3-bets` >= 8)
+knitr::kable(vp, align = "lrrrr", row.names = FALSE)
+```
+
+```{r tb-size}
+tb$szb <- cut(tb$tb_ratio, c(0, 2.6, 3.4, Inf),
+              labels = c("Small (under 2.6x open)", "Standard (2.6-3.4x)", "Big (over 3.4x)"))
+sz <- tb %>% filter(!is.na(szb)) %>% group_by(`3-bet size` = szb) %>%
+  summarise(`Your 3-bets` = n(), Net = tt(sum(net)), `bb/100` = sprintf("%+.1f", sum(net_bb) / n() * 100),
+            `Villain folds` = percent(mean(!saw_flop), 1), .groups = "drop")
+knitr::kable(sz, align = "lrrrr", row.names = FALSE)
+```
+
+<p class="meta">`r sprintf("Median 3-bet: %.1fx the open (~%.1f bb). A common size is 3x in position and 3.5-4x out of position; against callers, smaller 3-bets buy little fold equity and push the decision postflop.", median(tb$tb_ratio, na.rm = TRUE), median(tb$tb_to_bb, na.rm = TRUE))`</p>
+
+### Loose entries, hand by hand
+
+Your loose entries, by hand - what each one has cost (or made) and **how many VPIP points it adds**.
+This is the literal price of the hands you probably know you shouldn't be opening.
+
+```{r loose-cost}
+loose <- filter(cash, range_dir == "loose"); n_cash <- nrow(cash)
+lc <- loose %>% group_by(Hand = hand169) %>%
+  summarise(`Times played` = n(), net = sum(net), bbv = sum(net_bb) / n() * 100, .groups = "drop") %>%
+  arrange(net) %>% head(12) %>%
+  transmute(Hand, `Times played`, Net = tt(net), `bb/100` = sprintf("%+.1f", bbv),
+            `VPIP added` = sprintf("+%.1f pp", `Times played` / n_cash * 100))
+knitr::kable(lc, align = "lrrrr", row.names = FALSE)
+```
+
+<p class="meta">`r sprintf("All loose entries together: %d hands, %s, %+.1f bb/100, and about +%.1f VPIP points (your VPIP would be ~%.1f%% without them).", nrow(loose), tt(sum(loose$net)), bb100(loose), nrow(loose)/n_cash*100, mean(cash$vpip)*100 - nrow(loose)/n_cash*100)`</p>
+
+Your costliest loose entries up close (same card-review layout as your daily hands):
+
+```{r loose-cards, results='asis'}
+render_review_cards(loose %>% arrange(net) %>% head(4),
+  flagger = function(r) sprintf("loose open: %s from %s is outside your range", r$hand169, as.character(r$hero_pos)))
+```
+
+#### Loose entries by line
+
+Your VPIP example - "looser play means more spots I shouldn't be in, and I lose there" - made concrete.
+Each loose hand is bucketed by the **deepest action it reached**, and split by **position**. The point
+isn't that loose hands are bad on average; it's *where* they convert into losses.
+
+```{r loose-line}
+z <- function(x) coalesce(x, 0)
+loose <- loose %>% mutate(
+  line = case_when(
+    !saw_flop ~ "Folded preflop (cheap)",
+    z(river_call) > 0 ~ "Paid a river bet",
+    z(turn_call)  > 0 ~ "Paid a turn bet",
+    z(flop_call)  > 0 ~ "Paid a flop bet",
+    z(hero_river_bet) > 0 | z(hero_turn_bet) > 0 | z(hero_flop_bet) > 0 ~ "Bet / raised (aggressed)",
+    TRUE ~ "Checked down / gave up"),
+  posc = case_when(is.na(hero_first_flop) ~ "no flop", hero_first_flop ~ "OOP", TRUE ~ "IP"))
+ll <- loose %>% group_by(Line = line) %>%
+  summarise(Hands = n(), Net = tt(sum(net)), `bb/100` = sprintf("%+.1f", sum(net_bb) / n() * 100),
+            `Win %` = percent(mean(net > 0), 1), .groups = "drop") %>%
+  arrange(factor(Line, levels = c("Folded preflop (cheap)", "Paid a flop bet", "Paid a turn bet",
+                                  "Paid a river bet", "Bet / raised (aggressed)", "Checked down / gave up")))
+knitr::kable(ll, align = "lrrrr", row.names = FALSE)
+```
+
+```{r loose-pos}
+lp <- loose %>% filter(posc != "no flop") %>% group_by(Position = posc) %>%
+  summarise(Hands = n(), Net = tt(sum(net)), `bb/100` = sprintf("%+.1f", sum(net_bb) / n() * 100), .groups = "drop")
+knitr::kable(lp, align = "lrrr", row.names = FALSE,
+             caption = "Loose hands that saw a flop, by position")
+```
+
+> Loose hands in position: `r sprintf("%+.0f bb/100", bb100(filter(loose, posc=='IP')))`; out of position: `r sprintf("%+.0f", bb100(filter(loose, posc=='OOP')))`. Folding a loose hand preflop costs nothing; playing it is what costs, and cold-calling in position followed by passive postflop play is a common way to lose.
+
+#### Loose entries over time
+
+A first cut at tracking a leak across sessions: bars = loose entries **per 100 hands** that day (a *rate*,
+so a high-volume day isn't just a tall bar), line = the **cumulative** dollars they've cost. A flattening
+line means you've stopped the bleed; a falling bar-rate means you're entering tighter.
+
+```{r loose-time, eval=has_snaps}
+day_tot <- cash %>% mutate(d = as.Date(dt)) %>% count(d, name = "hd")
+lt <- loose %>% mutate(d = as.Date(dt)) %>% group_by(d) %>%
+  summarise(n = n(), net = sum(net), .groups = "drop") %>% arrange(d) %>%
+  left_join(day_tot, by = "d") %>% mutate(rate = n / hd * 100)
+lt$cum <- cumsum(lt$net); lt$idx <- seq_len(nrow(lt)); lt$dlab <- format(lt$d, "%b %d")
+plot_ly(lt, x = ~idx, height = 330) %>%
+  add_bars(y = ~rate, name = "Loose / 100 hands", marker = list(color = "#cdd5da"),
+           text = ~sprintf("%s<br>%d loose of %d hands", dlab, n, hd),
+           hovertemplate = "%{text}<br>%{y:.1f} per 100<extra></extra>") %>%
+  add_trace(y = ~cum, name = "Cumulative cost", yaxis = "y2", type = "scatter", mode = "lines+markers",
+            line = list(color = red, width = 2.2), marker = list(color = red, size = 5),
+            text = ~dlab, hovertemplate = "%{text}<br>cumulative %{y:.2f} T<extra></extra>") %>%
+  layout(title = list(text = "Loose entries by session: rate per 100 hands (bars) and cumulative cost (line)",
+                      font = list(size = 14, color = ink), x = 0.02),
+         xaxis = list(title = "", tickmode = "array", tickvals = lt$idx, ticktext = lt$dlab,
+                      tickangle = -40, tickfont = list(size = 10)),
+         yaxis = list(title = "Loose entries / 100 hands"),
+         yaxis2 = list(title = "Cumulative T", overlaying = "y", side = "right", showgrid = FALSE,
+                       zeroline = TRUE, zerolinecolor = "#c9ced3"),
+         legend = list(orientation = "h", x = 0, y = 1.12), hovermode = "x unified",
+         margin = list(r = 62, t = 54))
+```
+
+### Button hands folded first in
+
+Your button is a **net loser** despite being the seat that should print most - and the range model
+says why: you're too tight first-in. When it folds to you on the BTN with a hand **inside** your
+opening range, here's how often you fold it anyway, plus the hands you're passing up.
+
+```{r btn-steal}
+btn <- filter(cash, hero_pos == "BTN")
+spots <- filter(btn, rfi_opp == 1, in_open_range)          # openable, in-range, folded to you
+n_spots <- nrow(spots); n_passed <- sum(spots$range_dir == "passed", na.rm = TRUE)
+btn_bb <- bb100(btn)
+```
+
+<p class="meta">`r sprintf("On the button, first-in with an in-range hand (%d spots), you folded %d of them - a %.0f%% pass rate on hands you're supposed to be opening. Button win rate overall: %+.1f bb/100.", n_spots, n_passed, 100*n_passed/max(n_spots,1), btn_bb)`</p>
+
+```{r btn-passed}
+bp <- btn %>% filter(range_dir == "passed") %>% count(Hand = hand169, name = "Times folded", sort = TRUE) %>% head(12)
+knitr::kable(bp, align = "lr", row.names = FALSE,
+             caption = "Button hands you folded first-in that are inside your opening range")
+```
+
+> These are hands inside a standard button opening range that were folded first in. Folding them
+> gives the blinds a walk; on the button the usual fix is to open them.
+
+### Out-of-range days vs in-range days
+
+The day-level version of "did it cost you": for each preflop stat, your bb/100 on days you were
+**inside** the reg band vs **outside** it. Few days, high variance - read it as suggestive, not proof.
+
+```{r day-band, eval=has_snaps}
+band3 <- list(VPIP = bands$vpip, PFR = bands$pfr, `3-bet` = bands$threebet)
+colmap <- c(VPIP = "vpip", PFR = "pfr", `3-bet` = "threebet")
+db <- do.call(rbind, lapply(names(band3), function(k) {
+  b <- band3[[k]]; col <- colmap[[k]]; oob <- snaps[[col]] < b[1] | snaps[[col]] > b[2]
+  mk <- function(sel, lab) { d <- snaps[sel, , drop = FALSE]; if (!nrow(d)) return(NULL)
+    data.frame(Stat = k, Days = lab, `# days` = nrow(d), Hands = sum(d$n),
+               `bb/100` = sprintf("%+.1f", sum(d$bb100 * d$n) / sum(d$n)), check.names = FALSE) }
+  rbind(mk(!oob, "in band"), mk(oob, "out of band"))
+}))
+knitr::kable(db, align = "llrrr", row.names = FALSE)
+```
+
+## Postflop
+
+What happens after the flop, where most of the money is actually won and lost. **C-bet** = how
+often you continuation-bet the flop as the preflop aggressor; **fold-to-c-bet** = how often you
+fold when *facing* one; **WWSF** (won-when-saw-flop) = how often you end the hand in profit once
+you've seen a flop; **postflop AF** (aggression factor) = postflop bets+raises ÷ calls.
+
+```{r postflop-kpis}
+cb_pct  <- sum(cash$cbet_flop)    / pmax(sum(cash$cbet_opp), 1)
+ftc_pct <- sum(cash$fold_to_cbet) / pmax(sum(cash$fcbet_opp), 1)
+af      <- sum(cash$pf_aggr)      / pmax(sum(cash$pf_calls), 1)
+wwsf    <- mean(cash$net[cash$saw_flop] > 0)
+```
+
+<div class="kpi-row">
+<div class="kpi"><div class="kpi-label">C-bet flop</div><div class="kpi-value">`r percent(cb_pct, 0.1)`</div><div class="kpi-sub">as PF aggressor (n=`r sum(cash$cbet_opp)`)</div></div>
+<div class="kpi"><div class="kpi-label">Fold to c-bet</div><div class="kpi-value">`r percent(ftc_pct, 0.1)`</div><div class="kpi-sub">facing a c-bet (n=`r sum(cash$fcbet_opp)`)</div></div>
+<div class="kpi"><div class="kpi-label">Postflop AF</div><div class="kpi-value">`r sprintf("%.2f", af)`</div><div class="kpi-sub">bets+raises / calls</div></div>
+<div class="kpi"><div class="kpi-label">WWSF</div><div class="kpi-value">`r percent(wwsf, 0.1)`</div><div class="kpi-sub">won when saw flop</div></div>
+</div>
+
+> Benchmarks (reg, 6-max): c-bet flop ~50–65%; fold-to-c-bet ~45–55% (folding much more is
+> exploitable: opponents can bet any two cards); postflop AF ~2–3; WWSF ~45–50%. Here: c-bet
+> `r percent(cb_pct, 0.1)`, fold-to-c-bet `r percent(ftc_pct, 0.1)` (n=`r sum(cash$fcbet_opp)`), AF `r sprintf("%.2f", af)`.
+
+### The street funnel
+
+How a hand narrows from dealt cards to showdown. Each bar is the share of **all** hands that
+reach that street — the drop-offs show how often you fold vs. carry on.
+
+```{r street-funnel, fig.height=3.4}
+fn <- tibble::tibble(
+  stage = factor(c("Entered pot (VPIP)", "Saw flop", "Saw turn", "Saw river", "Showdown"),
+                 levels = rev(c("Entered pot (VPIP)", "Saw flop", "Saw turn", "Saw river", "Showdown"))),
+  pct = c(mean(cash$vpip), mean(cash$saw_flop), mean(cash$saw_turn),
+          mean(cash$saw_river), mean(cash$showdown)))
+ggplot(fn, aes(stage, pct)) +
+  geom_col(width = 0.65, fill = green) + coord_flip() +
+  geom_text(aes(label = percent(pct, 0.1)), hjust = -0.15, size = 3.6, color = ink) +
+  scale_y_continuous(labels = percent, limits = c(0, max(fn$pct) * 1.15), expand = c(0, 0)) +
+  labs(title = "Street funnel: share of all hands reaching each street", x = NULL, y = NULL)
+```
+
+> The funnel shows how hands narrow street by street. One that stays wide to the river can mean too many
+> loose calls; one that collapses fast can mean over-folding.
+
+### Postflop by position
+
+C-bet, fold-to-c-bet and WWSF by seat. Postflop samples are **much** smaller than preflop ones
+(you have to reach the flop first), so read these as directional until they fill in.
+
+```{r postflop-position}
+pp <- cash %>% group_by(Position = hero_pos) %>%
+  summarise(`Saw flop` = sum(saw_flop),
+            `C-bet %`        = percent(sum(cbet_flop)    / pmax(sum(cbet_opp), 1), 1),
+            `(C-bet n)`      = sum(cbet_opp),
+            `Fold to c-bet %`= percent(sum(fold_to_cbet) / pmax(sum(fcbet_opp), 1), 1),
+            `(n)`            = sum(fcbet_opp),
+            `WWSF %`         = percent(mean(net[saw_flop] > 0), 1), .groups = "drop")
+knitr::kable(pp, align = "lrrrrrr")
+```
+
+```{r postflop-position-chart, fig.height=3.6}
+ppl <- cash %>% group_by(hero_pos) %>%
+  summarise(`C-bet` = sum(cbet_flop) / pmax(sum(cbet_opp), 1),
+            `Fold to c-bet` = sum(fold_to_cbet) / pmax(sum(fcbet_opp), 1), .groups = "drop") %>%
+  pivot_longer(c(`C-bet`, `Fold to c-bet`))
+ggplot(ppl, aes(hero_pos, value, fill = name)) +
+  geom_col(position = "dodge", width = 0.7) +
+  scale_fill_manual(values = c(`C-bet` = green, `Fold to c-bet` = "#9aa7b0")) +
+  scale_y_continuous(labels = percent) +
+  labs(title = "C-bet and fold-to-c-bet frequency by position", x = NULL, y = NULL)
+```
+
+## Starting hands
+
+How your results break down by what you were dealt. Note: bb/100 here means **bb won per
+100 hands *of that type*** — a selection/value metric, not a sustained win rate (e.g. pocket
+pairs print because of set-mining, but you're only dealt one ~6% of the time).
+
+```{r hand-groups}
+# expected dealt frequency per group, from combinatorics over all 1326 two-card combos
+ref <- expand.grid(hi = 2:14, lo = 2:14); ref <- ref[ref$hi >= ref$lo, ]
+ref <- do.call(rbind, lapply(seq_len(nrow(ref)), function(i) {
+  a <- ref$hi[i]; b <- ref$lo[i]
+  if (a == b) data.frame(hi = a, lo = b, pair = TRUE,  suited = FALSE, combos = 6)
+  else  rbind(data.frame(hi = a, lo = b, pair = FALSE, suited = TRUE,  combos = 4),
+              data.frame(hi = a, lo = b, pair = FALSE, suited = FALSE, combos = 12)) }))
+.prem <- (ref$pair & ref$hi >= 10) | (ref$hi == 14 & ref$lo == 13)
+.brd  <- !ref$pair & ref$hi >= 10 & ref$lo >= 10
+ref$grp <- ifelse(.prem, "Premium (TT+, AK)", ifelse(ref$pair, "Other pair", ifelse(.brd, "Broadway",
+  ifelse(ref$suited & (ref$hi - ref$lo) <= 3 & ref$lo >= 5, "Suited connector",
+  ifelse(ref$suited, "Other suited", "Other offsuit")))))
+expg <- ref %>% group_by(grp) %>% summarise(exp_pct = sum(combos) / 1326, .groups = "drop")
+
+nd <- nrow(cash)
+hg <- cash %>% group_by(grp) %>%
+  summarise(Dealt = n(), played = mean(vpip), net = sum(net), bb100 = sum(net_bb)/n()*100, .groups = "drop") %>%
+  left_join(expg, by = "grp") %>% arrange(desc(bb100)) %>%
+  transmute(`Hand group` = grp, Dealt,
+            `Dealt %` = percent(Dealt/nd, 0.1), `Expected %` = percent(exp_pct, 0.1),
+            `Played %` = percent(played, 1), `bb/100` = sprintf("%+.1f", bb100), Net = tt(net))
+knitr::kable(hg, align = "lrrrrrr")
+```
+
+```{r hand-cat-chart, fig.height=3.4}
+hc <- cash %>% group_by(cat) %>% summarise(bb100 = sum(net_bb)/n()*100, hands = n(), .groups = "drop")
+ggplot(hc, aes(reorder(cat, bb100), bb100, fill = bb100 >= 0)) +
+  geom_col(width = 0.6) + geom_hline(yintercept = 0, color = ink) + coord_flip() +
+  geom_text(aes(label = sprintf("%+.1f", bb100)), hjust = ifelse(hc$bb100 >= 0, -0.1, 1.1), size = 3.4) +
+  scale_fill_manual(values = c(`TRUE` = green, `FALSE` = red), guide = "none") +
+  labs(title = "Win rate by hand type (bb/100)", x = NULL, y = "bb/100")
+```
+
+### Card luck: dealt vs expected
+
+Which cards you're dealt is pure chance: over a big sample you should see each hand type at a
+fixed rate the math fixes in advance. Comparing what you were **dealt** to what's **expected**
+separates *running bad* from *playing bad* — if you're under-dealt premiums, a soft stretch isn't
+your fault. (Frequencies are over non-bomb hands; the deck doesn't care, so expectations still hold.)
+
+```{r card-luck-cat}
+exp_cat <- c(`Pocket pair` = 78/1326, Suited = 312/1326, Offsuit = 936/1326)
+obs <- table(factor(cash$cat, levels = names(exp_cat)))
+clk <- data.frame(Type = names(exp_cat), Dealt = as.integer(obs),
+  `Dealt %` = percent(as.numeric(obs)/sum(obs), 0.1), `Expected %` = percent(exp_cat, 0.1),
+  check.names = FALSE)
+knitr::kable(clk, align = "lrrr")
+pval <- suppressWarnings(chisq.test(as.integer(obs), p = exp_cat)$p.value)
+```
+
+Overall your dealt distribution is **`r if (pval < 0.05) "skewed vs expected" else "statistically normal"`**
+(chi-square p = `r sprintf("%.2f", pval)`) — `r if (pval < 0.05) "an unusual run." else "no meaningful card bias; deviations are ordinary noise."`
+The interesting part is the **premium hands**, where small counts swing your results most:
+
+```{r card-luck-premium, fig.height=3.4}
+rch2 <- setNames(c(as.character(2:9), "T", "J", "Q", "K", "A"), 2:14)
+cash$hand <- ifelse(cash$pair, paste0(rch2[as.character(cash$hi)], rch2[as.character(cash$hi)]),
+  paste0(rch2[as.character(cash$hi)], rch2[as.character(cash$lo)], ifelse(cash$suited, "s", "o")))
+keys <- c("AA","KK","QQ","JJ","TT","AKs","AKo","AQs")
+combos <- function(hd) if (substr(hd,1,1)==substr(hd,2,2) & nchar(hd)==2) 6 else if (endsWith(hd,"s")) 4 else 12
+kl <- lapply(keys, function(hd){
+  d <- cash[cash$hand==hd, ]; e <- nd*combos(hd)/1326
+  data.frame(Hand=hd, Dealt=nrow(d), Expected=round(e,1),
+             Luck=sprintf("%+.0f%%", (nrow(d)/e-1)*100), Net=tt(sum(d$net)),
+             `bb/100`=sprintf("%+.1f", ifelse(nrow(d)>0, sum(d$net_bb)/nrow(d)*100, 0)), check.names=FALSE) })
+kl <- do.call(rbind, kl)
+knitr::kable(kl, align="lrrrrr", caption="Premium hands: dealt vs expected, and how they've paid (small samples , directional)")
+
+klp <- kl %>% transmute(Hand=factor(Hand, levels=keys), Dealt=as.numeric(Dealt), Expected=as.numeric(Expected)) %>%
+  tidyr::pivot_longer(c(Dealt, Expected))
+ggplot(klp, aes(Hand, value, fill=name)) +
+  geom_col(position="dodge", width=0.7) +
+  scale_fill_manual(values=c(Dealt=green, Expected="#9aa7b0")) +
+  labs(title="Premium hands dealt vs expected", x=NULL, y="count")
+```
+
+> Card luck explains *swings*, not your *win rate* — over a full sample it washes out to zero.
+> Use it to stay sane during downswings ("am I actually getting hands?"), not to excuse leaks.
+> The money you make *with* the premiums you're dealt (the Net column) is the part skill controls.
+
+### RNG audit
+
+Different question from the section above: not "did I run good," but "does CoinPoker's shuffle
+itself look like a fair 52-card deck?" Chi-square goodness-of-fit on rank, suit, and specific-card
+frequency, for both hole cards and (single-board) community cards, plus binomial checks on the
+pocket-pair and suited rates against their fixed combinatorial odds. Standalone + wired into every
+render (`rng_audit.R`).
+
+```{r rng-load}
+rng <- tryCatch(read.csv("coinpoker_rng_audit.csv", stringsAsFactors = FALSE), error = function(e) NULL)
+```
+
+```{r rng-table, eval=!is.null(rng)}
+rt <- rng %>% transmute(Test = test, `chi-sq` = ifelse(is.na(statistic), "-", sprintf("%.2f", statistic)),
+                         df = ifelse(is.na(df), "-", as.character(df)), `p-value` = sprintf("%.3f", p_value), n)
+knitr::kable(rt, align = "lrrrr", caption = "RNG audit: dealt frequencies vs a uniform, fair deck")
+```
+
+```{r rng-note, results='asis', eval=!is.null(rng)}
+n_sig <- sum(rng$p_value < 0.05)
+cat(sprintf('<p class="meta">%d of %d tests fall below p=0.05 &mdash; with this many tests, about %.1f "significant" hits are expected from a perfectly fair deck by chance alone, so %s. %s</p>',
+  n_sig, nrow(rng), 0.05 * nrow(rng),
+  ifelse(n_sig <= 1, "this is exactly what a fair shuffle looks like", "there are more hits than chance alone predicts, worth revisiting with more hands"),
+  ifelse(n_sig <= 1, "No evidence of a biased deck.", "Not proof of unfairness either &mdash; just a flag to keep watching.")))
+```
+
+```{r rng-missing, results='asis', eval=is.null(rng)}
+cat('<p class="meta">No <code>coinpoker_rng_audit.csv</code> found &mdash; run <code>Rscript rng_audit.R</code> (render does this automatically).</p>')
+```
+
+### The hand grid
+
+Every one of the 169 starting hands, laid out like a range chart — **pairs on the diagonal,
+suited upper-right, offsuit lower-left**. Shading = how often you **played** that holding
+(VPIP). This is your actual playing range; gaps and over-plays jump out immediately. Add more
+hands and it fills in and stabilizes.
+
+```{r hand-grid, fig.height=5.6}
+rch <- setNames(c(as.character(2:9), "T", "J", "Q", "K", "A"), 2:14)   # 14->A
+lab <- function(rI, cI) {                                              # cell (row,col) -> "AKs"
+  rhi <- 15 - pmin(rI, cI); rlo <- 15 - pmax(rI, cI)                   # rank values
+  ifelse(rI == cI, paste0(rch[as.character(15 - rI)], rch[as.character(15 - rI)]),
+         paste0(rch[as.character(rhi)], rch[as.character(rlo)], ifelse(cI > rI, "s", "o")))
+}
+full <- expand.grid(row = 1:13, col = 1:13)
+full$hand <- mapply(lab, full$row, full$col)
+
+agg <- cash %>%
+  mutate(row = ifelse(pair, 15 - hi, ifelse(suited, 15 - hi, 15 - lo)),
+         col = ifelse(pair, 15 - hi, ifelse(suited, 15 - lo, 15 - hi))) %>%
+  group_by(row, col) %>% summarise(dealt = n(), played = mean(vpip), net = sum(net), .groups = "drop")
+g <- left_join(full, agg, by = c("row", "col"))
+ranks <- c("A","K","Q","J","T","9","8","7","6","5","4","3","2")
+
+ggplot(g, aes(col, row, fill = played)) +
+  geom_tile(color = "white", linewidth = 0.4) +
+  geom_text(aes(label = hand), size = 2.3, color = "#33414a") +
+  scale_fill_gradient(low = "#f4f7fa", high = green, na.value = "#fafbfb",
+                      labels = percent, name = "played %") +
+  scale_x_continuous(breaks = 1:13, labels = ranks, position = "top", expand = c(0, 0)) +
+  scale_y_reverse(breaks = 1:13, labels = ranks, expand = c(0, 0)) +
+  coord_equal() +
+  labs(title = "Starting-hand grid: shaded by how often you played it", x = NULL, y = NULL) +
+  theme(panel.grid = element_blank(), axis.ticks = element_blank())
+```
+
+```{r hand-extremes}
+he <- cash %>% group_by(hand = ifelse(pair, paste0(rch[as.character(hi)], rch[as.character(hi)]),
+                  paste0(rch[as.character(hi)], rch[as.character(lo)], ifelse(suited, "s", "o")))) %>%
+  summarise(dealt = n(), played = percent(mean(vpip), 1), net = sum(net), .groups = "drop") %>%
+  filter(dealt >= 8)
+knitr::kable(bind_rows(
+  he %>% slice_max(net, n = 5) %>% mutate(group = "Most profitable"),
+  he %>% slice_min(net, n = 5) %>% mutate(group = "Most costly")) %>%
+  transmute(Group = group, Hand = hand, Dealt = dealt, `Played` = played, Net = tt(net)),
+  align = "llrrr", caption = "Best/worst specific hands (>=8 times dealt; noisy, directional only)")
+```
+
+## Showdown
+
+```{r showdown}
+saw <- filter(cash, saw_flop)
+wtsd <- mean(saw$showdown)
+wsd  <- mean(cash$net[cash$showdown] > 0)
+```
+
+<div class="kpi-row">
+<div class="kpi"><div class="kpi-label">WTSD</div><div class="kpi-value">`r percent(wtsd, 0.1)`</div><div class="kpi-sub">saw flop → showdown</div></div>
+<div class="kpi"><div class="kpi-label">W$SD</div><div class="kpi-value">`r percent(wsd, 0.1)`</div><div class="kpi-sub">showdowns won</div></div>
+<div class="kpi"><div class="kpi-label">Saw flop</div><div class="kpi-value">`r percent(mean(cash$saw_flop), 0.1)`</div><div class="kpi-sub">of all hands</div></div>
+</div>
+
+### Made hands at showdown
+
+The hand you actually made at showdown, how often you make each, and the money it wins or loses.
+This is where loose-passive play shows its bill: strong hands print, but showing down weak ones
+(one pair, ace-high) bleeds it back.
+
+```{r made-hands}
+ord <- c("High Card","One Pair","Two Pair","Three Of A Kind","Straight","Flush","Full House","Four Of A Kind","Straight Flush")
+sd <- cash %>% filter(showdown, !is.na(sd_cat))
+mh <- sd %>% group_by(sd_cat) %>%
+  summarise(`Showdowns` = n(), `Won %` = percent(mean(net > 0), 1),
+            `Net` = tt(sum(net)), `Avg/hand` = tt(mean(net)), .groups = "drop") %>%
+  mutate(sd_cat = factor(sd_cat, levels = ord)) %>% arrange(sd_cat) %>%
+  rename(`Made hand` = sd_cat)
+knitr::kable(mh, align = "lrrrr")
+```
+
+```{r made-hands-chart, fig.height=3.4}
+mc <- sd %>% group_by(sd_cat) %>% summarise(net = sum(net), .groups = "drop") %>%
+  mutate(sd_cat = factor(sd_cat, levels = ord))
+ggplot(mc, aes(sd_cat, net, fill = net >= 0)) +
+  geom_col(width = 0.7) + geom_hline(yintercept = 0, color = ink) +
+  scale_fill_manual(values = c(`TRUE` = green, `FALSE` = red), guide = "none") +
+  scale_y_continuous(labels = function(x) paste0("$", x)) +
+  labs(title = "Net by made hand at showdown", x = NULL, y = "net ($)") +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+```
+
+### Hands that beat Hero at showdown
+
+The flip side: when you lose a showdown the winner has to table their hand, so we know exactly
+what you're paying off. The split tells you *which* leak — losing to **better one pair** means
+kicker/second-pair calldowns (outkicked); losing to **two pair+** means refusing to fold a strong-
+but-beaten hand to obvious aggression.
+
+```{r what-beats-you}
+ordv <- c("High Card","One Pair","Two Pair","Three Of A Kind","Straight","Flush","Full House","Four Of A Kind","Straight Flush")
+loss <- cash %>% filter(showdown, net < 0, !is.na(villain_cat))
+wb <- loss %>% group_by(villain_cat) %>%
+  summarise(`Times` = n(), `$ lost` = tt(sum(net)), `Avg` = tt(mean(net)), .groups = "drop") %>%
+  mutate(villain_cat = factor(villain_cat, levels = ordv)) %>% arrange(villain_cat) %>%
+  rename(`Beaten by` = villain_cat)
+knitr::kable(wb, align = "lrrr")
+```
+
+When you specifically held **one pair** and lost — your most common and most expensive showdown —
+here's what beat you:
+
+```{r one-pair-matchup}
+op <- cash %>% filter(showdown, net < 0, sd_cat == "One Pair", !is.na(villain_cat))
+opm <- op %>% mutate(villain_cat = factor(villain_cat, levels = ordv)) %>%
+  group_by(`Beaten by` = villain_cat) %>%
+  summarise(Times = n(), `$ lost` = tt(sum(net)), .groups = "drop") %>% arrange(`Beaten by`)
+knitr::kable(opm, align = "lrr")
+op_kick <- op %>% filter(villain_cat == "One Pair"); op_2p <- op %>% filter(villain_cat == "Two Pair")
+```
+
+> Two readings, both foldable: **`r nrow(op_kick)` of your one-pair losses (`r tt(sum(op_kick$net))`)
+> were to a *better one pair*** — outkicked, i.e. calling with a dominated pair/kicker — and
+> **`r nrow(op_2p)` (`r tt(sum(op_2p$net))`) were to two pair**, i.e. paying off made strength.
+> The first is a preflop/flop hand-selection fix; the second is a turn/river discipline fix.
+
+### Calls made when likely behind
+
+A proxy for the "I knew I was beat but called anyway" leak: chips you **called on the turn and
+river in hands you lost**. It isn't pure (some were correct calls that lost, some turn calls were
+draws) — but at volume it's a strong signal for over-calling. River calls that lost are the
+cleanest read: the river is a pure bluff-catch, so paying it off and losing means you were behind.
+
+```{r paying-off}
+lost <- filter(cash, net < 0)
+river_paid <- sum(lost$river_call); turn_paid <- sum(lost$turn_call)
+n_river <- sum(lost$river_call > 0); n_turn <- sum(lost$turn_call > 0)
+```
+
+<div class="kpi-row">
+<div class="kpi"><div class="kpi-label">River calls that lost</div><div class="kpi-value neg">`r tt(river_paid)`</div><div class="kpi-sub">`r n_river` hands paid off on the river</div></div>
+<div class="kpi"><div class="kpi-label">Turn calls that lost</div><div class="kpi-value neg">`r tt(turn_paid)`</div><div class="kpi-sub">`r n_turn` hands, includes missed draws</div></div>
+<div class="kpi"><div class="kpi-label">Combined</div><div class="kpi-value neg">`r tt(river_paid + turn_paid)`</div><div class="kpi-sub">vs total net `r tt(sum(cash$net))`</div></div>
+</div>
+
+<p class="meta">Folding even a fraction of these spots swings more than your whole net result. Not every
+call here was a mistake — but the size of the number relative to your bottom line is the point:
+big turn/river bluff-catches are the cheapest leak to plug.</p>
+
+#### River calls by bet size (share of the pot)
+
+This is the poker-accurate cut: the villain's river bet as a fraction of the pot it was bet into
+(reconstructed action by action and checked against the hand-history totals). Bet sizing signals
+*how polarized* a betting range is — and which sizes you're profitably bluff-catching vs. paying off.
+
+```{r call-size}
+rc <- cash %>% filter(river_call > 0, !is.na(river_pot), river_pot > river_call) %>%
+  mutate(betpot = river_call / (river_pot - river_call),
+         bucket = cut(betpot, c(0, 0.4, 0.7, 1.1, Inf),
+                      labels = c("<= 1/3 pot", "~1/2 pot", "~full pot", "overbet")))
+cs <- rc %>% group_by(`Villain river bet` = bucket) %>%
+  summarise(Calls = n(), `Won %` = percent(mean(net > 0), 1), Net = tt(sum(net)),
+            `Avg/call` = tt(mean(net)), .groups = "drop")
+knitr::kable(cs, align = "lrrrr")
+```
+
+```{r call-size-chart, fig.height=3.2}
+# NOTE order matters: compute `won` from the row-level net BEFORE the `net = sum(net)`
+# summary shadows the column (else mean(net>0) reads the scalar sum -> bogus 0%/100%).
+csc <- rc %>% group_by(bucket) %>% summarise(won = mean(net > 0), n = n(), net = sum(net), .groups = "drop")
+ggplot(csc, aes(bucket, net, fill = net >= 0)) +
+  geom_col(width = 0.65) + geom_hline(yintercept = 0, color = ink) +
+  geom_text(aes(label = sprintf("%.0f%% won (n=%d)", won * 100, n)),
+            vjust = ifelse(csc$net >= 0, -0.4, 1.2), size = 3.3, color = ink) +
+  scale_fill_manual(values = c(`TRUE` = green, `FALSE` = red), guide = "none") +
+  scale_y_continuous(labels = function(x) paste0("$", x)) +
+  labs(title = "River calls: net by villain bet size (% of pot)", x = NULL, y = "net ($)")
+```
+
+> Overbets (`r csc$n[csc$bucket=="overbet"]` calls, `r percent(csc$won[csc$bucket=="overbet"],1)` won) come from a polarized range, nearly
+> all strong hands or air, and at low stakes they skew strong. Tiny bets (a third of the pot or less) are
+> often thin value. Compare the won share at each size to the price: a size that loses at its price is
+> one to call less often against.
+
+### Biggest losses
+
+Your costliest single hands, with the turn/river you called and what you ended up holding. Sort
+your memory against these: the ones with a big river call and a weak made hand are the reviewable
+ones.
+
+```{r biggest-losses}
+bl <- cash %>% arrange(net) %>% head(10) %>%
+  transmute(Net = tt(net), Hand = hero_cards, Pos = as.character(hero_pos),
+            `Turn call` = tt(turn_call), `River call` = tt(river_call),
+            `You made` = ifelse(is.na(sd_cat), "no showdown", sd_cat),
+            `Lost to` = ifelse(is.na(villain_cards), "-",
+                               paste0(villain_cards, " (", villain_cat, ")")))
+knitr::kable(bl, align = "rllrrll")
+```
+
+## Draws and set-mining
+
+The question behind your one-pair/ace-high losses: how much were busted draws, are you paying too
+much to chase, and how much of your win comes from *getting there* (hitting draws, flopping sets)
+rather than from value? This reconstructs the board on every hand to flag flush/straight draws and
+whether they completed. (Single-board hands only; a "draw" = flush or open/gutshot straight draw
+on the flop or turn that wasn't already a made straight/flush.)
+
+```{r draws-calc}
+rkv <- setNames(2:14, c(as.character(2:9), "T", "J", "Q", "K", "A"))
+cardsplit <- function(s) if (is.na(s) || s == "") character(0) else str_extract_all(s, "[2-9TJQKA][cdhs]")[[1]]
+csuit <- function(c) substr(c, 2, 2); crank <- function(c) rkv[substr(c, 1, 1)]
+has_flush <- function(allc, hero) any(vapply(c("c","d","h","s"), function(s) sum(csuit(allc)==s) >= 5 && any(csuit(hero)==s), logical(1)))
+has_straight <- function(allc, hero) {
+  r <- unique(crank(allc)); if (14 %in% r) r <- c(r, 1); hr <- unique(crank(hero)); if (14 %in% hr) hr <- c(hr, 1)
+  any(vapply(1:10, function(lo) { w <- lo:(lo+4); all(w %in% r) && any(w %in% hr) }, logical(1)))
+}
+draw_here <- function(allc, hero) {
+  fd <- any(vapply(c("c","d","h","s"), function(s) sum(csuit(allc)==s)==4 && any(csuit(hero)==s), logical(1)))
+  r <- unique(crank(allc)); if (14 %in% r) r <- c(r, 1); hr <- unique(crank(hero)); if (14 %in% hr) hr <- c(hr, 1)
+  sd <- any(vapply(1:10, function(lo) { w <- lo:(lo+4); sum(w %in% r)==4 && any(w %in% hr) }, logical(1)))
+  fd || sd
+}
+sb <- cash %>% filter(saw_flop, !is.na(flop), nchar(hero_cards) >= 4)
+od <- hit <- logical(nrow(sb))
+for (i in seq_len(nrow(sb))) {
+  hero <- cardsplit(sb$hero_cards[i]); fl <- cardsplit(sb$flop[i])
+  tn <- cardsplit(sb$turn_card[i]); rv <- cardsplit(sb$river_card[i])
+  if (length(hero) < 2 || length(fl) < 3) next
+  fb <- c(hero, fl); tb <- c(fb, tn); full <- c(tb, rv)
+  made_flop <- has_flush(fb, hero) || has_straight(fb, hero)
+  od[i]  <- (draw_here(fb, hero) || (length(tn) > 0 && draw_here(tb, hero))) && !made_flop
+  hit[i] <- has_flush(full, hero) || has_straight(full, hero)
+}
+sb$on_draw <- od; sb$hit <- hit
+dr <- filter(sb, on_draw)
+d_hit <- sum(dr$net[dr$hit]); d_miss <- sum(dr$net[!dr$hit])
+chased <- sum(dr$turn_call + dr$river_call)
+busted_sd <- sb %>% filter(showdown, sd_cat %in% c("One Pair","High Card"), on_draw, !hit)
+
+# set-mining
+hc <- lapply(cash$hero_cards, cardsplit)
+cash$pp  <- vapply(hc, function(x) length(x)==2 && substr(x[1],1,1)==substr(x[2],1,1), logical(1))
+cash$ppr <- vapply(hc, function(x) if (length(x)==2 && substr(x[1],1,1)==substr(x[2],1,1)) substr(x[1],1,1) else NA_character_, character(1))
+ppf <- cash %>% filter(pp, saw_flop, !is.na(flop))
+ppf$set <- mapply(function(r, f) sum(substr(cardsplit(f), 1, 1) == r) >= 1, ppf$ppr, ppf$flop)
+pp_net <- sum(cash$net[cash$pp]); set_net <- sum(ppf$net[ppf$set])
+```
+
+### Set-mining
+
+<div class="kpi-row">
+<div class="kpi"><div class="kpi-label">Flopped a set</div><div class="kpi-value">`r percent(mean(ppf$set), 1)`</div><div class="kpi-sub">`r sum(ppf$set)` of `r nrow(ppf)` pairs that saw a flop (~12% is normal)</div></div>
+<div class="kpi"><div class="kpi-label">Net from sets</div><div class="kpi-value pos">`r tt(set_net)`</div><div class="kpi-sub">just `r sum(ppf$set)` hands</div></div>
+<div class="kpi"><div class="kpi-label">Pocket-pair net</div><div class="kpi-value `r if(pp_net>=0) "pos" else "neg"`">`r tt(pp_net)`</div><div class="kpi-sub">`r tt(pp_net - set_net)` without the sets</div></div>
+</div>
+
+> Sets are **`r percent(set_net/pp_net, 1)` of pocket-pair profit**. Set-mining is a repeatable edge,
+> but it depends on the preflop call being small relative to stacks (implied odds); small pairs facing big
+> raises without deep stacks are folds.
+
+### Draws: hit, missed, and taken to showdown
+
+<div class="kpi-row">
+<div class="kpi"><div class="kpi-label">On a draw</div><div class="kpi-value">`r percent(mean(sb$on_draw), 1)`</div><div class="kpi-sub">of flops seen (flush/straight draw)</div></div>
+<div class="kpi"><div class="kpi-label">Hit by river</div><div class="kpi-value">`r percent(mean(dr$hit), 1)`</div><div class="kpi-sub">`r sum(dr$hit)` of `r nrow(dr)` draws got there</div></div>
+<div class="kpi"><div class="kpi-label">Draw net (hit − miss)</div><div class="kpi-value `r if(sum(dr$net)>=0) "pos" else "neg"`">`r tt(sum(dr$net))`</div><div class="kpi-sub">`r tt(d_hit)` hit, `r tt(d_miss)` missed</div></div>
+</div>
+
+> Drawing hands win **`r tt(d_hit)`** when they get there and lose **`r tt(d_miss)`** when they don't, **`r tt(sum(dr$net))`**
+> in all; near break-even is how draws are supposed to net out. The leak to check is the back end:
+> **`r nrow(busted_sd)`** One-Pair or High-Card showdowns were busted draws taken to showdown, for
+> **`r tt(sum(busted_sd$net))`**. A missed draw with ace-high or bottom pair is usually a give-up or a bluff, not a call.
+
+## Bet sizing
+
+Sizing carries information. *Playing hands backwards* from showdowns, we can read what villains'
+river sizes mean — and check whether your own sizing leaks your hand strength. (River only; samples
+are small, so read these as signals to test at the table, not settled facts.)
+
+```{r betsize-calc}
+made_str <- function(hole, board) {
+  if (length(hole) < 2 || length(board) < 5) return(NA_character_)
+  allc <- c(hole, board)
+  if (has_flush(allc, hole) || has_straight(allc, hole)) return("value")
+  rk <- table(crank(allc))
+  if (max(rk) >= 3 || sum(rk >= 2) >= 2) return("value")
+  if (sum(rk >= 2) == 1) return("one pair")
+  "bluff"
+}
+hb <- cash %>% filter(hero_river_bet > 0, !is.na(hero_river_pot), hero_river_pot > 0,
+                      !is.na(flop), !is.na(river_card), nchar(hero_cards) >= 4) %>%
+  mutate(betpot = hero_river_bet / hero_river_pot, called = showdown,
+         size = cut(betpot, c(0, 0.4, 0.7, Inf),
+                    labels = c("small (<= 1/3 pot)", "medium (~1/2 pot)", "big (>= 2/3 pot)")))
+hb$strength <- mapply(function(hc, fl, tc, rc) made_str(cardsplit(hc),
+                      c(cardsplit(fl), cardsplit(tc), cardsplit(rc))),
+                      hb$hero_cards, hb$flop, hb$turn_card, hb$river_card)
+vs <- cash %>% filter(river_call > 0, !is.na(river_pot), river_pot > river_call, !is.na(villain_cat)) %>%
+  mutate(vbetpot = river_call / (river_pot - river_call),
+         vstrength = factor(ifelse(villain_cat %in% c("Two Pair","Three Of A Kind","Straight","Flush","Full House"),
+                            "value (2pair+)", ifelse(villain_cat == "One Pair", "one pair", "bluff (high card)")),
+                            levels = c("bluff (high card)", "one pair", "value (2pair+)")))
+mm <- str_match(cash$hero_cards, "([2-9TJQKA]).\\s?([2-9TJQKA]).")
+cash$akq <- (mm[,2] == "A" & mm[,3] %in% c("K","Q")) | (mm[,3] == "A" & mm[,2] %in% c("K","Q"))
+akq <- filter(cash, akq)
+```
+
+### Opponents' river sizing by hand shown
+
+For every river you called and they tabled a hand, their bet size vs. what they actually had:
+
+```{r villain-size}
+vt <- vs %>% group_by(`Villain showed` = vstrength) %>%
+  summarise(Hands = n(), `Median bet (x pot)` = sprintf("%.2f", median(vbetpot)),
+            `Your net` = tt(sum(net)), .groups = "drop")
+knitr::kable(vt, align = "lrrr")
+```
+
+> Read villain river sizes by what they showed: if bluffs cluster at certain sizes and value at others,
+> that size is a tell for calling or folding. Samples here are small, so treat any pattern as a working
+> read. **AK/AQ:** `r tt(sum(akq$net))`, `r sprintf("%+.1f", sum(akq$net_bb)/nrow(akq)*100)` bb/100 over `r nrow(akq)` hands; top pair with a top
+> kicker is still one pair, and the losses usually come from paying off two pair.
+
+### Hero's river sizing and results
+
+```{r my-river-size}
+mr <- hb %>% group_by(`Your bet size` = size) %>%
+  summarise(Bets = n(), `Folded them out %` = percent(mean(!called), 1),
+            Net = tt(sum(net)), `Avg/bet` = tt(mean(net)), .groups = "drop")
+knitr::kable(mr, align = "lrrrr")
+```
+
+Your river betting is a **strength** overall (`r tt(sum(hb$net))` across `r nrow(hb)` bets) — bigger
+bets fold villains out more often, and every size is in the black. The question is whether it's
+*balanced*, which is the next table.
+
+### River bet size vs hand strength
+
+```{r my-river-tell}
+st <- hb %>% filter(!is.na(strength)) %>% group_by(`Your bet size` = size) %>%
+  summarise(Bets = n(), `Bluff %` = percent(mean(strength == "bluff"), 1),
+            `One pair %` = percent(mean(strength == "one pair"), 1),
+            `Value (2pair+) %` = percent(mean(strength == "value"), 1), .groups = "drop")
+knitr::kable(st, align = "lrrrr")
+```
+
+> If big river bets are almost always value, the betting range is face-up: a thinking opponent folds to
+> them for free. Missed draws are the natural hands to balance them with, as bluffs instead of calls.
+
+### Busted draws on the river
+
+You've been trying to turn missed draws into river bluffs. The trap: a bluff that **works** shows up
+as "won, no showdown" - you never reveal the busted hand - so counting *shown* bluffs undercounts
+badly. Board reconstruction fixes that: of the hands where you **reached the river with a busted draw**,
+how often did you **bet it** (the adjustment) vs **call** (the old leak) vs check/give up - counted
+whether or not it got called. Earlier vs recent (median-date split).
+
+```{r busted-river}
+br <- sb %>% filter(on_draw, !hit, saw_river)
+br$act <- ifelse(coalesce(br$hero_river_bet, 0) > 0, "Bet it (bluff)",
+          ifelse(coalesce(br$river_call, 0) > 0, "Called (paid off)", "Checked / gave up"))
+br$era <- ifelse(as.Date(br$dt) >= median(as.Date(br$dt)), "recent", "earlier")
+bet_share <- function(e) mean(br$act[br$era == e] == "Bet it (bluff)")
+brt <- br %>% group_by(Era = factor(era, c("earlier", "recent"))) %>%
+  summarise(`Busted-draw rivers` = n(),
+            `Bet (bluff) %` = percent(mean(act == "Bet it (bluff)"), 1),
+            `Called %` = percent(mean(act == "Called (paid off)"), 1),
+            `Gave up %` = percent(mean(act == "Checked / gave up"), 1), .groups = "drop")
+knitr::kable(brt, align = "lrrrr", row.names = FALSE)
+```
+
+```{r busted-river-note, results='asis'}
+bl <- filter(br, act == "Bet it (bluff)")
+cat(sprintf('<p class="meta">Across the whole sample, betting a busted draw is roughly breakeven (%d bets, %s) - a balance / board-coverage play, not a money-printer. By this measure your bluffing is flat-to-down recently (%s vs %s of busted-draw rivers), so the adjustment is not showing up here yet. CAVEAT: this counts only busted-DRAW bluffs; pure-air bluffs (no draw) need full 7-card reconstruction and are not captured - treat it as a lower bound.</p>',
+  nrow(bl), tt(sum(bl$net)), percent(bet_share("earlier"), 1), percent(bet_share("recent"), 1)))
+```
+
+### Bets by hand class: value, semi-bluff, air
+
+Now that the postflop engine evaluates Hero's hand at every street, we can decompose **what backs each
+bet**. A "bluff" here = a bet where your best five-card hand using a hole card is **no pair or better** -
+so a paired *board* you don't share never counts as a hand. Within that, what equity is behind it: a
+**draw** (flush / straight, with cards to come), **overcards**, or **pure air**? Made-hand bets are split
+into **value** (two pair+) and **marginal** (one pair). River has no cards to come, so a missed hand is
+either ace/over-high or air.
+
+```{r bet-anatomy}
+anat <- function(streetbet, made, fd, sdraw, overs, is_river) {
+  has <- !is.na(streetbet) & streetbet > 0 & !is.na(made)
+  cls <- rep(NA_character_, length(made))
+  cls[has & made >= 2] <- "Value (2pair+)"
+  cls[has & made == 1] <- "Marginal (one pair)"
+  air <- has & made == 0
+  if (is_river) {
+    cls[air & overs >= 1] <- "Air - ace/over-high"
+    cls[air & overs == 0] <- "Air - nothing"
+  } else {
+    cls[air & (fd | sdraw != "none")] <- "Semi-bluff (draw)"
+    cls[air & !(fd | sdraw != "none") & overs >= 1] <- "Bluff - overcards"
+    cls[air & !(fd | sdraw != "none") & overs == 0] <- "Bluff - pure air"
+  }
+  cls
+}
+cash$fl_bet_class <- anat(cash$hero_flop_bet,  cash$made_flop,  cash$fl_fd, cash$fl_sdraw, cash$fl_overs, FALSE)
+cash$tn_bet_class <- anat(cash$hero_turn_bet,  cash$made_turn,  cash$tn_fd, cash$tn_sdraw, cash$tn_overs, FALSE)
+cash$rv_bet_class <- anat(cash$hero_river_bet, cash$made_river, FALSE, "none",
+                          ifelse(is.na(cash$made_river), 0, 0), TRUE)  # river overs handled in engine via river_backing
+# river over-high: recover from river_backing where it's a bluff, else from made
+cash$rv_bet_class[!is.na(cash$river_backing) & cash$river_backing == "ace/over-high"] <- "Air - ace/over-high"
+cash$rv_bet_class[!is.na(cash$river_backing) & cash$river_backing == "air"]           <- "Air - nothing"
+
+anat_tbl <- function(cls, betcol, potcol, lv) {
+  d <- data.frame(cls = cls, net = cash$net, net_bb = cash$net_bb, betpot = cash[[betcol]] / cash[[potcol]])
+  d <- d[!is.na(d$cls), ]
+  d %>% group_by(`What's behind it` = factor(cls, lv)) %>%
+    summarise(Bets = n(), `Median size (x pot)` = sprintf("%.2f", median(betpot, na.rm = TRUE)),
+              Net = tt(sum(net)), `bb/100*` = sprintf("%+.0f", sum(net_bb) / n() * 100),
+              .groups = "drop")
+}
+fl_lv <- c("Value (2pair+)", "Marginal (one pair)", "Semi-bluff (draw)", "Bluff - overcards", "Bluff - pure air")
+rv_lv <- c("Value (2pair+)", "Marginal (one pair)", "Air - ace/over-high", "Air - nothing")
+```
+
+```{r bet-anatomy-flop}
+knitr::kable(anat_tbl(cash$fl_bet_class, "hero_flop_bet", "hero_flop_pot", fl_lv),
+             align = "lrrrr", caption = "Flop bets, by what's behind them")
+```
+
+```{r bet-anatomy-river}
+knitr::kable(anat_tbl(cash$rv_bet_class, "hero_river_bet", "hero_river_pot", rv_lv),
+             align = "lrrrr", caption = "River bets, by what's behind them")
+```
+
+> This splits aggression into value, one pair, draws and overcards (semi-bluffs, which are supposed to
+> bet), and pure air. A large pure-air share would mean bluffing too much; a large semi-bluff share is
+> normal aggression.
+> *(\*Per-class bb/100 is a within-bucket rate, not comparable to the overall - outcome-selected.)*
+
+### River bluffs by size over time
+
+Has river bluff sizing changed over time? River bets with **no made hand** (ace-high / air), bucketed by size,
+earlier vs recent:
+
+```{r river-bluff-size}
+rvb <- cash %>% filter(!is.na(river_bluff), river_bluff, !is.na(river_betpot)) %>%
+  mutate(size = cut(river_betpot, c(0, 0.4, 0.7, Inf),
+                    labels = c("small (<=1/3)", "medium (~1/2)", "big (>=2/3)")),
+         era = ifelse(as.Date(dt) >= median(as.Date(cash$dt)), "recent", "earlier"))
+if (nrow(rvb) >= 5) {
+  rs <- rvb %>% group_by(`Bet size` = size) %>%
+    summarise(Bets = n(), `Got called %` = percent(mean(showdown == 1), 1),
+              Net = tt(sum(net)), .groups = "drop")
+  knitr::kable(rs, align = "lrrr", row.names = FALSE)
+} else cat(sprintf('<p class="meta">Only %d no-made-hand river bets in the sample - too few to bucket by size yet. </p>', nrow(rvb)))
+```
+
+```{r river-bluff-size-note, results='asis'}
+if (nrow(rvb) >= 5) {
+  byera <- rvb %>% group_by(era) %>% summarise(big = mean(size == "big (>=2/3)"), .groups = "drop")
+  ge <- function(e) { v <- byera$big[byera$era == e]; if (length(v)) percent(v, 1) else "n/a" }
+  cat(sprintf('<p class="meta">Share of your river bluff-bets that are big (>=2/3 pot): %s earlier vs %s recent. Small sample - treat as a signal, not proof.</p>', ge("earlier"), ge("recent")))
+}
+```
+
+## C-bets by board texture
+
+The flop's *texture* should change how you play: on **dry** boards the preflop raiser's range is
+ahead, so c-bets print; on **wet** boards (flushy/connected) and **monotone** boards villains
+connect more, so betting should slow down. This classifies every flop you saw and checks whether
+your c-bet frequency and results actually move with the board. ("Wet" = monotone, or two-tone and
+connected; "Dry" = rainbow and disconnected; "Paired" pulled out separately.)
+
+```{r texture-calc}
+flop_texture <- function(f) {
+  c <- cardsplit(f); if (length(c) < 3) return(NA_character_)
+  r <- crank(c); su <- csuit(c); paired <- any(duplicated(r))
+  suit <- if (length(unique(su)) == 1) "mono" else if (length(unique(su)) == 2) "two-tone" else "rainbow"
+  connected <- !paired && (max(r) - min(r)) <= 4
+  if (paired) return("Paired")
+  if (suit == "mono") return("Wet (monotone)")
+  if (connected && suit == "two-tone") return("Wet (conn. + flushy)")
+  if (connected || suit == "two-tone") return("Semi-wet")
+  "Dry (rainbow)"
+}
+lev <- c("Dry (rainbow)", "Semi-wet", "Wet (conn. + flushy)", "Wet (monotone)", "Paired")
+tx <- cash %>% filter(saw_flop, !is.na(flop))
+tx$tex <- factor(vapply(tx$flop, flop_texture, character(1)), levels = lev)
+```
+
+```{r texture-table}
+txt <- tx %>% group_by(`Flop texture` = tex) %>%
+  summarise(Flops = n(), `C-bet %` = percent(sum(cbet_flop) / pmax(sum(cbet_opp), 1), 1),
+            `Won when saw flop` = percent(mean(net > 0), 1),
+            `bb/100` = sprintf("%+.0f", sum(net_bb) / n() * 100), Net = tt(sum(net)), .groups = "drop")
+knitr::kable(txt, align = "lrrrrr")
+```
+
+```{r texture-chart, fig.height=3.4}
+txc <- tx %>% group_by(tex) %>%
+  summarise(cbet = sum(cbet_flop) / pmax(sum(cbet_opp), 1), n = sum(cbet_opp), .groups = "drop")
+ggplot(txc, aes(tex, cbet, fill = tex == "Wet (monotone)")) +
+  geom_col(width = 0.65) +
+  geom_text(aes(label = sprintf("%.0f%% (n=%d)", cbet * 100, n)), vjust = -0.4, size = 3.3, color = ink) +
+  scale_fill_manual(values = c(`TRUE` = red, `FALSE` = green), guide = "none") +
+  scale_y_continuous(labels = percent, limits = c(0, max(txc$cbet) * 1.15)) +
+  labs(title = "Your flop c-bet % by texture (it should NOT be flat)", x = NULL, y = "c-bet %") +
+  theme(axis.text.x = element_text(angle = 15, hjust = 1))
+```
+
+> A good c-bet strategy leans on texture: more often on dry, unconnected boards, less on monotone and
+> connected ones, carefully on paired boards where what beats one pair is two pair or better. A flat
+> c-bet rate across textures is the thing to look for.
+
+### Texture gap over time
+
+The one number to move: **c-bet on dry rainbow *minus* c-bet on monotone**. If you're adjusting, dry
+goes **up**, monotone goes **down**, and this **gap grows positive**. Split earlier vs recent (median-date)
+so you can watch it shift as you add sessions — it re-computes every time you parse new hands.
+
+```{r texture-adjust}
+adj <- tx %>% filter(tex %in% c("Dry (rainbow)", "Wet (monotone)")) %>%
+  mutate(era = ifelse(as.Date(dt) >= median(as.Date(cash$dt)), "recent", "earlier")) %>%
+  group_by(tex, era) %>% summarise(cb = sum(cbet_flop) / pmax(sum(cbet_opp), 1), n = sum(cbet_opp), .groups = "drop")
+cbof <- function(t, e) { v <- adj$cb[adj$tex == t & adj$era == e]; if (length(v)) v else NA_real_ }
+nof  <- function(t, e) { v <- adj$n[adj$tex == t & adj$era == e]; if (length(v)) v else 0L }
+at <- data.frame(
+  Texture = c("Dry (rainbow): fire MORE", "Wet (monotone): fire LESS", "GAP (dry minus mono)"),
+  Earlier = c(percent(cbof("Dry (rainbow)","earlier"),1), percent(cbof("Wet (monotone)","earlier"),1),
+              percent(cbof("Dry (rainbow)","earlier") - cbof("Wet (monotone)","earlier"),1)),
+  Recent  = c(percent(cbof("Dry (rainbow)","recent"),1),  percent(cbof("Wet (monotone)","recent"),1),
+              percent(cbof("Dry (rainbow)","recent")  - cbof("Wet (monotone)","recent"),1)),
+  `n (recent)` = c(nof("Dry (rainbow)","recent"), nof("Wet (monotone)","recent"), NA),
+  check.names = FALSE)
+knitr::kable(at, align = "lrrr", row.names = FALSE)
+```
+
+```{r texture-adjust-note, results='asis'}
+ge <- cbof("Dry (rainbow)","earlier") - cbof("Wet (monotone)","earlier")
+gr <- cbof("Dry (rainbow)","recent")  - cbof("Wet (monotone)","recent")
+dir <- if (is.na(gr - ge)) "not enough recent monotone flops to read yet" else
+       if (gr > ge) sprintf("moving the right way (gap %s -> %s)", percent(ge,1), percent(gr,1)) else
+       sprintf("not adjusting yet (gap %s -> %s)", percent(ge,1), percent(gr,1))
+cat(sprintf('<p class="meta">Goal: a clearly <b>positive, growing</b> gap. Right now it&rsquo;s <b>%s</b>. Monotone flops are rare (recent n=%d), so the recent column needs a few sessions before it means much.</p>', dir, nof("Wet (monotone)","recent")))
+```
+
+## Betting lines
+
+When do your bets actually fold people out, and do multi-street barrels work? This tracks every bet
+you make on each street — its size relative to the pot, whether it took the pot down (everyone
+folded), and the net — plus the full flop-turn-river *line* you took. (Single-board hands;
+"folded out" = no one continued to the next street, or no showdown on the river.)
+
+```{r lines-calc}
+flopeq <- function(hc, fl) {
+  he <- cardsplit(hc); bd <- cardsplit(fl)
+  if (length(he) < 2 || length(bd) < 3) return(NA_character_)
+  a <- c(he, bd)
+  if (has_flush(a, he) || has_straight(a, he)) return("made hand")
+  if (max(table(crank(a))) >= 2) return("made hand")
+  if (draw_here(a, he)) return("draw")
+  "air"
+}
+streetbets <- bind_rows(
+  cash %>% filter(hero_flop_bet  > 0, hero_flop_pot  > 0) %>% transmute(street = "Flop",  bp = hero_flop_bet/hero_flop_pot,   fo = is.na(turn_card),  net),
+  cash %>% filter(hero_turn_bet  > 0, hero_turn_pot  > 0) %>% transmute(street = "Turn",  bp = hero_turn_bet/hero_turn_pot,   fo = is.na(river_card), net),
+  cash %>% filter(hero_river_bet > 0, hero_river_pot > 0) %>% transmute(street = "River", bp = hero_river_bet/hero_river_pot, fo = !showdown,          net)
+) %>% mutate(street = factor(street, levels = c("Flop","Turn","River")),
+             Size = cut(bp, c(0, 0.4, 0.7, Inf), labels = c("small (<=1/3)", "medium (~1/2)", "big (>=2/3)")))
+bl <- cash %>% mutate(
+  bf = hero_flop_bet > 0 & !is.na(hero_flop_bet),
+  bt = hero_turn_bet > 0 & !is.na(hero_turn_bet),
+  br = hero_river_bet > 0 & !is.na(hero_river_bet),
+  line = paste0(ifelse(bf, "B", "-"), ifelse(bt, "B", "-"), ifelse(br, "B", "-")))
+```
+
+### Fold equity by street and size
+
+```{r street-foldequity}
+streetbets %>% group_by(Street = street, Size) %>%
+  summarise(Bets = n(), `Folded out %` = percent(mean(fo), 1), Net = tt(sum(net)), .groups = "drop") %>%
+  knitr::kable(align = "llrrr")
+```
+
+> Fold equity normally rises with bet size. If small bets fold few opponents, cheap bluffs aren't buying
+> much against this pool, and the fold equity lives in the bigger sizes.
+
+### Small c-bets by hand class
+
+```{r flop-cbet-equity}
+fb <- cash %>% filter(hero_flop_bet > 0, hero_flop_pot > 0, !is.na(flop), nchar(hero_cards) >= 4) %>%
+  mutate(small = hero_flop_bet / hero_flop_pot <= 0.4, foldout = is.na(turn_card))
+fb$eq <- mapply(flopeq, fb$hero_cards, fb$flop)
+fb %>% filter(small, !is.na(eq)) %>% mutate(eq = factor(eq, levels = c("air", "draw", "made hand"))) %>%
+  group_by(`Your flop equity` = eq) %>%
+  summarise(`Small c-bets` = n(), `Folded out %` = percent(mean(foldout), 1),
+            Net = tt(sum(net)), `Avg/bet` = tt(mean(net)), .groups = "drop") %>%
+  knitr::kable(align = "lrrrr")
+```
+
+> Splitting small c-bets by hand class separates two different bets: thin value with a made hand,
+> which profits when worse hands call, and cheap bluffs with air, which need folds. If the air version
+> loses, check it or size up rather than firing small.
+
+### Lines by street (flop-turn-river)
+
+`B` = you bet that street, `-` = checked / didn't bet. So `B--` is a flop c-bet then give up, `-BB`
+is check-flop then barrel turn and river.
+
+```{r betting-lines}
+bl %>% filter(bf | bt | br) %>% group_by(Line = line) %>%
+  summarise(Hands = n(), Net = tt(sum(net)), `Avg/hand` = tt(mean(net)), .groups = "drop") %>%
+  arrange(desc(Hands)) %>% knitr::kable(align = "lrrr")
+```
+
+> Each line is a street-by-street sequence (B = bet, - = check or call). One- and two-street value
+> lines normally carry the profit. A triple barrel (`BBB`) near break-even usually means thin value
+> is getting called by better or bluffs aren't getting folds.
+
+### Calls facing bets (flop and turn)
+
+The defensive flip side: when a villain *bets* into you on the flop or turn, how do your calls do by
+their size? (River calls are bucketed earlier; this is the earlier streets.) Bet sizes are the
+villain's bet as a share of the pot.
+
+```{r facing-calc}
+facing <- bind_rows(
+  cash %>% filter(flop_call > 0, !is.na(flop_call_pot), flop_call_pot > flop_call) %>%
+    transmute(Street = "Flop", betpot = flop_call / (flop_call_pot - flop_call), net),
+  cash %>% filter(turn_call > 0, !is.na(turn_call_pot), turn_call_pot > turn_call) %>%
+    transmute(Street = "Turn", betpot = turn_call / (turn_call_pot - turn_call), net)
+) %>% mutate(Street = factor(Street, levels = c("Flop", "Turn")),
+             Size = cut(betpot, c(0, 0.5, 0.75, Inf), labels = c("< 1/2 pot", "1/2 - 3/4 pot", ">= 3/4 pot")))
+```
+
+```{r facing-table}
+facing %>% group_by(Street, `Villain bet` = Size) %>%
+  summarise(`Your calls` = n(), `Won %` = percent(mean(net > 0), 1), Net = tt(sum(net)), .groups = "drop") %>%
+  knitr::kable(align = "llrrr")
+```
+
+> Small bets get called widely because they are cheap; that is where flop calls tend to lose, by peeling
+> with weak hands and paying more on later streets. Compare the won share and net across sizes on each
+> street: a size where calls lose consistently is the one to tighten against.
+
+### Passive vs. aggressive lines
+
+```{r passive-lines}
+pa <- cash %>% filter(saw_flop) %>% mutate(
+  bet_any = (hero_flop_bet > 0 & !is.na(hero_flop_bet)) | (hero_turn_bet > 0 & !is.na(hero_turn_bet)) | (hero_river_bet > 0 & !is.na(hero_river_bet)),
+  called_any = flop_call > 0 | turn_call > 0 | river_call > 0,
+  Line = ifelse(bet_any, "You bet >= 1 street", ifelse(called_any, "Check-call only (never bet)", "Checked down / folded")))
+pa %>% group_by(`Postflop line` = Line) %>%
+  summarise(Hands = n(), Net = tt(sum(net)), `Avg/hand` = tt(mean(net)), .groups = "drop") %>%
+  arrange(desc(Hands)) %>% knitr::kable(align = "lrrr")
+```
+
+> Betting at least one street nets **`r tt(sum(pa$net[pa$bet_any]))`**; check-call only nets
+> **`r tt(sum(pa$net[!pa$bet_any & pa$called_any]))`**. Part of any gap is selection (strong hands get bet,
+> marginal ones get called), so read the direction, not the size.
+
+### Hand-trajectory clusters
+
+The section above buckets hands by a literal bet/check string per street, chosen by us. This asks a
+different question: if you hand k-means a richer feature set (preflop role, position, multiway,
+bet-size-as-%-pot per street, call indicators, final made-hand strength, how far the hand went) and
+let it group hands on its own, what comes out? This is genuinely **unsupervised** — cluster
+membership never sees the hand's result — so it isn't limited by the hidden-information ceiling that
+capped supervised prediction (a villain's hole cards, which supervised models tried to predict, are
+never used here). **Caveats, upfront:** `k=6` and the feature list are modeling choices, not a
+discovered truth; some described traits are correlated proxies for the same underlying fact (e.g.
+"checks flop" and "calls flop" together just mean "passive on the flop," not two separate signals);
+small clusters are noisier. Standalone + wired into every render (`hand_clusters.R`).
+
+```{r hc-load}
+hc <- tryCatch(read.csv("coinpoker_hand_clusters_summary.csv", stringsAsFactors = FALSE), error = function(e) NULL)
+```
+
+```{r hc-table, eval=!is.null(hc)}
+ht <- hc %>% transmute(Cluster = cluster, Hands = n, `What it looks like` = Description,
+                        Net = tt(Net), `bb/100` = sprintf("%+.0f", `bb.100`))
+knitr::kable(ht, align = "clrrr", caption = "Hand-trajectory clusters, found by k-means (not hand-picked)")
+```
+
+```{r hc-chart, eval=!is.null(hc), fig.height=3.4}
+hc$lab <- factor(sprintf("C%d", hc$cluster), levels = sprintf("C%d", hc$cluster[order(-hc$bb.100)]))
+ggplot(hc, aes(reorder(lab, bb.100), bb.100, fill = bb.100 >= 0)) +
+  geom_col(width = 0.6) + coord_flip() + geom_hline(yintercept = 0, color = ink) +
+  scale_fill_manual(values = c(`TRUE` = green, `FALSE` = red), guide = "none") +
+  labs(title = "bb/100 by cluster", x = NULL, y = "bb/100")
+```
+
+```{r hc-note, results='asis', eval=!is.null(hc)}
+best <- hc$Description[which.max(hc$bb.100)]; worst <- hc$Description[which.min(hc$bb.100)]
+cat(sprintf('<p class="meta">The clusters are found from the shape of each hand (streets reached, who bet, pot size) without seeing any result. Best cluster by bb/100: <b>%s</b>; worst: <b>%s</b>. If they line up with the leak ledger and betting-lines sections, that is an independent cross-check, since this method never saw an outcome.</p>',
+  best, worst))
+```
+
+```{r hc-missing, results='asis', eval=is.null(hc)}
+cat('<p class="meta">No <code>coinpoker_hand_clusters_summary.csv</code> found &mdash; run <code>Rscript hand_clusters.R</code> (render does this automatically).</p>')
+```
+
+## Position & pot size
+
+Two structural cuts: how many players you're up against (heads-up vs multiway), and whether you have
+position (act last) or not. "OOP" here = you were first to act on the flop — exact heads-up, a strong
+proxy multiway.
+
+```{r pospot-calc}
+sf <- cash %>% filter(saw_flop, !is.na(n_flop))
+```
+
+### Heads-up vs. multiway
+
+```{r hu-mw}
+sf %>% mutate(`Pot` = ifelse(n_flop <= 2, "Heads-up", "Multiway (3+)")) %>%
+  group_by(Pot) %>%
+  summarise(Flops = n(), `Won when saw flop` = percent(mean(net > 0), 1),
+            `bb/100` = sprintf("%+.0f", sum(net_bb) / n() * 100), Net = tt(sum(net)), .groups = "drop") %>%
+  knitr::kable(align = "lrrrr")
+```
+
+> Heads-up and multiway pots are different games: one pair and draws lose value fast as players are
+> added, and thin value bets and bluffs work worse against several opponents. If multiway pots trail
+> heads-up ones, the usual adjustment is to continue with stronger hands multiway.
+
+### In position vs. out of position
+
+```{r ip-oop}
+sf %>% filter(!is.na(hero_first_flop)) %>%
+  mutate(Position = ifelse(hero_first_flop, "OOP (act first)", "IP (act last)")) %>%
+  group_by(Position) %>%
+  summarise(Flops = n(), `Won when saw flop` = percent(mean(net > 0), 1),
+            `Went to showdown` = percent(mean(showdown), 1),
+            `bb/100` = sprintf("%+.0f", sum(net_bb) / n() * 100), Net = tt(sum(net)), .groups = "drop") %>%
+  knitr::kable(align = "lrrrrr")
+```
+
+```{r ip-oop-potsize}
+sf %>% filter(!is.na(hero_first_flop)) %>%
+  mutate(Position = ifelse(hero_first_flop, "OOP", "IP"), Pot = ifelse(n_flop <= 2, "Heads-up", "Multiway")) %>%
+  group_by(Position, Pot) %>% summarise(Flops = n(), Net = tt(sum(net)), .groups = "drop") %>%
+  knitr::kable(align = "llrr")
+```
+
+> An aggregate by position mixes two very different situations, raising preflop and calling preflop.
+> The breakdown below separates them.
+
+#### Position split by preflop role
+
+Splitting each by whether you were the preflop **aggressor** (you raised) or a **caller**:
+
+```{r ip-oop-2x2}
+sf %>% filter(!is.na(hero_first_flop)) %>%
+  mutate(Position = ifelse(hero_first_flop, "OOP", "IP"),
+         Role = ifelse(hero_pf_aggr, "Aggressor (raised pre)", "Caller (called pre)")) %>%
+  group_by(Position, Role) %>%
+  summarise(Flops = n(), `bb/100` = sprintf("%+.0f", sum(net_bb) / n() * 100), Net = tt(sum(net)), .groups = "drop") %>%
+  knitr::kable(align = "llrr")
+```
+
+> This splits each side by who raised preflop. In-position play as the preflop raiser should be the
+> best spot; in-position play as a caller is where passive players lose, by peeling and calling down
+> instead of betting when checked to. If the two in-position rows point in opposite directions, the
+> average above hides the real problem: what's done with position, not position itself.
+
+#### C-bet fold rate in and out of position
+
+How often a flop c-bet takes the pot right away, in position and out of position:
+
+```{r ip-oop-cbet-fe}
+sf %>% filter(cbet_flop == 1, !is.na(hero_first_flop)) %>%
+  mutate(pos = ifelse(hero_first_flop, "OOP c-bet", "IP c-bet"), foldout = is.na(turn_card)) %>%
+  group_by(`Your c-bet` = pos) %>%
+  summarise(`C-bets` = n(), `Folded everyone out %` = percent(mean(foldout), 1), Net = tt(sum(net)), .groups = "drop") %>%
+  knitr::kable(align = "lrrr")
+```
+
+> C-bets normally fold more opponents in position. If they do here, the in-position calling hands above
+> are missing the spots where betting works best: when checked to in position, bet more and call less.
+
+## Leak ledger
+
+Every leak this dashboard found, tagged per hand and summed. **Two views, on purpose.** Each leak is a
+*hypothesis* associated with lost chips, not a proven cause of any one hand — and a single hand can carry
+several tags at once, so you can't just add them up. So: **(1) the independent view** measures each leak's
+size on its own (these overlap and intentionally *don't* sum to your net); **(2) the attribution view**
+gives every *losing* hand its single most-proximal leak, so those buckets sum cleanly and answer "what is
+my loss actually made of?"
+
+```{r ledger-calc}
+# NOTE: lk_light_3bet is intentionally excluded - on this sample the corrected (genuinely
+# light, vs early openers only) version is ~breakeven, so it is not a leak. See note below.
+leakdefs <- c(lk_busted_sd = "Busted draw taken to showdown", lk_paid_river = "Paid off river with a weak hand",
+              lk_loose_passive = "Loose & passive in position",
+              lk_loose_entry = "Loose entry (range too wide)", lk_air_bet = "Bet (near-)air postflop",
+              lk_skipped_steal = "Skipped steal (range too tight)")
+ind <- bind_rows(lapply(names(leakdefs), function(k) {
+  sel <- !is.na(cash[[k]]) & cash[[k]]
+  data.frame(key = k, Leak = unname(leakdefs[k]), Hands = sum(sel),
+             net = sum(cash$net[sel]), net_bb = sum(cash$net_bb[sel]), stringsAsFactors = FALSE)
+})) %>% arrange(net)
+
+# primary attribution: each losing hand -> one dominant leak (engine column)
+prilab <- c(paid_river = "Paid off river with a weak hand", busted_sd = "Busted draw taken to showdown",
+            loose_passive = "Loose & passive in position",
+            loose_entry = "Loose entry (range too wide)")
+pa <- cash %>% filter(!is.na(primary_leak)) %>% group_by(primary_leak) %>%
+  summarise(Hands = n(), net = sum(net), .groups = "drop") %>% arrange(net)
+pa$Leak <- unname(prilab[pa$primary_leak])
+pa_attr <- sum(pa$net)
+loss_total <- sum(cash$net[cash$net < 0])
+```
+
+### View 1: each leak on its own (overlapping)
+
+```{r ledger-independent}
+it <- ind %>% transmute(Leak, Hands, Net = tt(net),
+                        `bb/100*` = sprintf("%+.0f", net_bb / pmax(Hands, 1) * 100))
+knitr::kable(it, align = "lrrr", row.names = FALSE)
+```
+
+<p class="meta">Overlapping by design (one hand can be several leaks) - the Net column does **not** sum to
+your result. "Skipped steal" shows positive because those are *folds* (saved blinds / opportunity cost),
+not realized losses; it rides in the independent view but is excluded from the attribution waterfall below.
+*Per-leak bb/100 is a within-bucket rate, not comparable to your overall.*</p>
+
+### View 2: losses attributed to leaks
+
+Each **losing** hand assigned its single most-proximal leak (river call > busted draw to showdown > loose
+& passive > loose entry). These sum to a real number: `r tt(pa_attr)` across `r sum(pa$Hands)`
+hands, which is `r percent(pa_attr/loss_total, 1)` of your total losing-hand volume (`r tt(loss_total)`).
+The rest is untagged variance - losses we have **no named leak for** (coolers, run-bad, marginal spots).
+
+```{r ledger-pareto}
+pp <- pa %>% mutate(mag = -net) %>% arrange(desc(mag))
+pp$cum <- cumsum(pp$mag) / sum(pp$mag)
+short_lab <- c(paid_river = "River calls", busted_sd = "Busted draws", loose_passive = "Passive IP", loose_entry = "Loose entry")
+pp$idx <- seq_len(nrow(pp)); pp$short <- unname(short_lab[pp$primary_leak])
+plot_ly(pp, x = ~idx, height = 360) %>%
+  add_bars(y = ~mag, name = "Loss attributed", marker = list(color = "#a8432f"),
+           text = ~short, hovertemplate = "%{text}<br>%{y:.0f} T attributed<extra></extra>") %>%
+  add_trace(y = ~cum, name = "Cumulative share", yaxis = "y2", type = "scatter", mode = "lines+markers",
+            line = list(color = ink, width = 2), marker = list(color = ink, size = 5),
+            hovertemplate = "%{y:.0%} of attributed loss<extra></extra>") %>%
+  layout(title = list(text = "Leak Pareto: where the attributed losses concentrate",
+                      font = list(size = 14, color = ink), x = 0.02),
+         xaxis = list(title = "", tickmode = "array", tickvals = pp$idx, ticktext = pp$short, tickfont = list(size = 11)),
+         yaxis = list(title = "T attributed"),
+         yaxis2 = list(title = "Cumulative", overlaying = "y", side = "right", showgrid = FALSE,
+                       range = c(0, 1.02), tickformat = ".0%"),
+         legend = list(orientation = "h", x = 0, y = 1.12), hovermode = "x unified",
+         margin = list(r = 62, t = 54))
+```
+
+### Leaks over time
+
+A cumulative-cost line only ever slopes **down**, which makes "is this flattening out?" almost impossible to
+read by eye. So instead of the running total, this shows each leak's **cost per 100 hands** over a **trailing
+600-hand window** — roughly "how much is this leak bleeding me *right now*." The x-axis is cumulative hands
+(a calendar axis would squeeze busy weeks and stretch quiet ones).
+Read it off the **zero line**: a line sitting **at zero** means that leak has stopped accruing (leveled off);
+a line **diving below zero** means it's actively costing you, and the deeper it goes the worse it's getting.
+Per-leak totals are in View 2 above; this is purely the *trend*.
+
+```{r ledger-time}
+top_leaks <- pp$primary_leak[1:min(4, nrow(pp))]
+ord <- cash %>% arrange(dt) %>% mutate(idx = row_number())
+N <- nrow(ord); W <- 600
+lo <- pmax(seq_len(N) - W, 0); win <- seq_len(N) - lo                 # trailing window (partial at the start)
+roll100 <- function(v) { cs <- c(0, cumsum(v)); (cs[seq_len(N) + 1] - cs[lo + 1]) / win * 100 }
+lcol <- c(paid_river = red, busted_sd = "#b98a3e", loose_passive = green, loose_entry = "#9aa7b0")
+p <- plot_ly(height = 380)
+for (k in top_leaks) {
+  rate <- roll100(ifelse(ord$primary_leak %in% k, ord$net, 0))
+  p <- add_trace(p, x = ord$idx, y = rate, name = unname(prilab[k]),
+                 type = "scatter", mode = "lines", line = list(color = unname(lcol[k]), width = 2),
+                 text = format(as.Date(ord$dt), "%b %d"),
+                 hovertemplate = "%{text}<br>%{x} hands<br>%{y:.1f} T per 100 hands<extra></extra>")
+}
+p %>% layout(title = list(text = "Cost per 100 hands by leak (trailing 600-hand window)", font = list(size = 14, color = ink), x = 0.02),
+             xaxis = list(title = "Cumulative hands played", tickfont = list(size = 10)),
+             yaxis = list(title = "T per 100 hands (0 = not costing you now)", zeroline = TRUE,
+                          zerolinecolor = "#5b6770", zerolinewidth = 1.5),
+             legend = list(orientation = "h", x = 0, y = 1.14), hovermode = "x unified", margin = list(t = 60))
+```
+
+> Read the ledger top-down. Two numbers matter for each leak: the total it cost and how concentrated
+> it is (cost per hand). A concentrated leak (large losses in few hands) is usually one decision to
+> change; a diffuse one (many small losses) is a habit, slower to fix. River pay-offs and busted draws
+> taken to showdown are the same root decision, calling a river when beaten, so read them as one.
+
+## Counterfactual replay with simple rules
+
+Re-runs your actual hand history under four mechanical policies and compares the alternate
+bankroll curve to what really happened. **Policies A/B (fold loose hands) are clean counterfactuals**
+— each hand's result is swapped independently using only the range model's own classification, with
+the blind you'd still post priced in (folding the SB isn't free). **Policies C/D (session hand-cap,
+stop-loss) are hindsight, not a proven real-time rule** — an unplayed hand nets exactly $0, so the
+arithmetic is exact, but this can't tell you whether you'd have known to quit *before* seeing the
+result. Standalone + wired into every render (`counterfactual_replay.R`).
+
+```{r cf-load}
+cf <- tryCatch(read.csv("coinpoker_counterfactual.csv", stringsAsFactors = FALSE), error = function(e) NULL)
+cf_curves <- tryCatch(read.csv("coinpoker_counterfactual_curves.csv", stringsAsFactors = FALSE), error = function(e) NULL)
+cf_ok <- !is.null(cf) && !is.null(cf_curves)
+```
+
+```{r cf-table, eval=cf_ok}
+ct <- cf %>% transmute(Policy = policy, Net = tt(net), `bb/100` = sprintf("%+.1f", bb100),
+                        `vs. actual` = tt(delta_vs_actual))
+knitr::kable(ct, align = "lrrr", caption = "Counterfactual replay: net result under each policy")
+```
+
+```{r cf-chart, eval=cf_ok, fig.height=4}
+pol_cols <- c(actual = ink, A = "#9aa7b0", B = "#c4ccd1", C = green, D = "#7fa8cf")
+pol_lab <- c(actual = "Actual", A = "A: fold loose SB", B = "B: fold all loose",
+             C = "C: session hand-cap", D = "D: stop-loss 3 buy-ins")
+p <- plot_ly(height = 380)
+for (k in names(pol_lab))
+  p <- add_trace(p, data = cf_curves, x = ~idx, y = as.formula(paste0("~", k)), name = pol_lab[[k]],
+                  type = "scatter", mode = "lines",
+                  line = list(color = pol_cols[[k]], width = ifelse(k == "actual", 2.2, 1.4),
+                              dash = ifelse(k == "actual", "solid", "dot")))
+p %>% layout(title = list(text = "Cumulative bb: actual vs. each policy", font = list(size = 14)),
+             xaxis = list(title = "hands played", gridcolor = grid),
+             yaxis = list(title = "cumulative bb", gridcolor = grid, zeroline = TRUE, zerolinecolor = ink),
+             legend = list(orientation = "h", y = -0.2), margin = list(t = 40)) %>%
+  config(displaylogo = FALSE, modeBarButtonsToRemove = c("select2d", "lasso2d", "autoScale2d"))
+```
+
+```{r cf-note, results='asis', eval=cf_ok}
+a_delta <- cf$delta_vs_actual[cf$policy == "A: fold loose SB hands"]
+c_delta <- cf$delta_vs_actual[grepl("^C:", cf$policy)]
+d_delta <- cf$delta_vs_actual[grepl("^D:", cf$policy)]
+cat(sprintf('<p class="meta">Folding loose small-blind hands would have made the result %s by %s. Policy C (a flat cap on hands per session) changes it by %s; policy D (stopping after a set loss) by %s. If C recovers more than D, playing less per session matters more than quitting when stuck. These are replays of the same hands with simple rules, not predictions.</p>',
+  ifelse(a_delta < 0, "worse", "better"), tt(abs(a_delta)), tt(c_delta), tt(d_delta)))
+```
+
+```{r cf-missing, results='asis', eval=!cf_ok}
+cat('<p class="meta">No counterfactual-replay output found &mdash; run <code>Rscript counterfactual_replay.R</code> (render does this automatically).</p>')
+```
+
+## Value attribution by decision
+
+The leak ledger above is **result** attribution: it sorts hands by how they *finished*. This section is
+**value** attribution — it asks whether a decision was correctly priced **at the moment you made it**,
+before the board decided anything. A call can be perfectly +EV and still lose; a thin one can win and still
+have been a mistake. We can score two decision types objectively from the price and your equity alone, with
+no read on the villain required. *(The most recent day is held out as a test set; these descriptive tables
+use all hands.)*
+
+### Break-even fold rates for bluffs and semi-bluffs
+
+For a bet with no made hand, the objective number is the **breakeven fold %**: how often the villain has to
+fold for the bet to profit. Pure air needs `bet / (bet + pot)`; a semi-bluff needs **less**, because the
+draw wins some of the times you get called.
+
+```{r va-bets}
+bt <- dec %>% filter(decision %in% c("bluff_bet", "semibluff_bet"))
+btt <- bt %>%
+  group_by(Street = factor(street, c("flop", "turn", "river")),
+           Type = ifelse(decision == "semibluff_bet", "semi-bluff (has a draw)", "bluff (no equity)")) %>%
+  summarise(Bets = n(),
+            `Median fold% needed` = percent(median(breakeven_fold), 1),
+            `Cheap (<40% needed)` = sprintf("%d", sum(breakeven_fold < 0.40)),
+            `Need >55%` = sprintf("%d", sum(breakeven_fold > 0.55)), .groups = "drop")
+knitr::kable(btt, align = "llrrrr", row.names = FALSE,
+             caption = "Bluff/semi-bluff bets, by the fold % required to break even")
+```
+
+> The lower the break-even fold rate, the cheaper the bet. A median under about 40% means most bets
+> only need ordinary folding to profit; many bets above 55% would mean the bluffs are priced too high.
+> This is the conservative read: semi-bluffs can also improve or barrel later, which lowers the real bar.
+
+### Implied odds needed for draw calls
+
+Draws are harder, and the honest framing took a revision. A first instinct was to **bracket** each call
+between rule-of-2 (one card) and rule-of-4 (both cards) odds — but rule-of-4 is *not* an upper bound: a
+draw's **implied odds** (the extra you win when it gets there) sit *above* it, so "−EV even at rule-of-4"
+wouldn't actually mean "mistake." So we drop the bracket. The clean, assumption-free quantity is the
+**implied-odds breakeven**: taking the immediate price and one-card equity as given, how much *more* must
+you win when you hit to make the call break even —
+
+$$X = \frac{(1-e)\,C}{e} - P \qquad\text{(extra to win on later streets, expressed below as a multiple of the call }C\text{).}$$
+
+A call that's already +EV on the immediate price needs **none** ("priced now"). Everything else needs
+implied odds — and then the question is whether you actually *collect* them, which we can measure.
+
+```{r va-draws}
+dr  <- dec %>% filter(decision == "draw_call")
+drh <- dr %>% distinct(id, .keep_all = TRUE)   # hand-level for realized $ (a hand can hold flop AND turn draw calls)
+drt <- dr %>% group_by(Street = factor(street, c("flop", "turn"))) %>%
+  summarise(`Draw calls` = n(),
+            `Priced now` = percent(mean(good), 1),
+            `Implied odds needed` = sprintf("%.1fx call", median(req_implied_x[!good])),
+            `Predicted hit` = percent(mean(equity), 1),
+            `Realized hit` = percent(mean(hit), 1), .groups = "drop")
+knitr::kable(drt, align = "lrrrrr", row.names = FALSE,
+             caption = "Draw calls: the implied-odds bar, and whether the draw actually hit")
+```
+
+```{r va-draws-hist}
+dn <- dr %>% filter(!good, req_implied_x > 0, req_implied_x < 12)
+plot_ly(dn, x = ~req_implied_x, type = "histogram", height = 320,
+        marker = list(color = "#b98a3e", line = list(color = "white", width = 1)),
+        hovertemplate = "need %{x:.1f}x the call<br>%{y} draw calls<extra></extra>") %>%
+  layout(title = list(text = "How steep is the implied-odds bar on your draw calls?",
+                      font = list(size = 14, color = ink), x = 0.02),
+         xaxis = list(title = "extra winnings needed when you hit (x the call)"),
+         yaxis = list(title = "draw calls"), bargap = 0.05, margin = list(t = 50))
+```
+
+```{r va-draws-note, results='asis'}
+won <- drh$net[drh$hit]; brk <- drh$net[!drh$hit]
+cat(sprintf('<p class="meta"><b>The calibration is the punchline.</b> Your draws hit %s of the time against a predicted %s &mdash; the evaluator&rsquo;s out-counts are honest, not optimistic. But when they hit you netted only %s on average, against misses of %s, so the whole draw-calling group nets <b>%s</b> over %d hands. Translation: most of these calls need %s the call back in implied odds, and you&rsquo;re not collecting it. The fix isn&rsquo;t to stop drawing &mdash; it&rsquo;s to draw on the calls that are <i>priced now</i> or close, and fold the thin ones that need a big future payoff you rarely get (the right tail of the chart above).</p>',
+  percent(mean(drh$hit), 1), percent(mean(dr$equity), 1), tt(mean(won)), tt(mean(brk)),
+  tt(sum(drh$net)), nrow(drh), sprintf("%.1fx", median(dr$req_implied_x[!dr$good]))))
+```
+
+## Missed betting opportunities
+
+Value attribution scores the decisions you *did* make. This flips it: where did you reach a street with a
+bet available and **check** instead? Two kinds — **missed value** (a made hand checked down that a worse
+hand would have paid) and **missed bluffs** (air/busted draws given up in spots where the pool folds). The
+`$` figures are **rough, pool-calibrated estimates for ranking only** (villains fold ~60% / call ~40% on
+rivers, measured from these same histories) — they sort the spots, they don't claim precise EV. Full list
+in `coinpoker_missed_ops.csv`.
+
+```{r mo-load}
+mo <- tryCatch(read.csv("coinpoker_missed_ops.csv", stringsAsFactors = FALSE),
+               error = function(e) NULL)
+mo_lab <- c(missed_value_strong = "Checked a strong made hand (2 pair+) that won",
+            missed_value_thin   = "Checked a winning one pair (thin value)",
+            turn_monster_checked= "Slow-played a set+ on the turn",
+            small_value_river   = "Bet a big hand too small (<40% pot)",
+            missed_bluff_busted = "Gave up a busted draw (no bluff)",
+            missed_bluff_air    = "Gave up air with fold equity")
+```
+
+```{r mo-summary, eval=!is.null(mo) && nrow(mo) > 0}
+sm <- mo %>%
+  mutate(What = factor(mo_lab[type], levels = unname(mo_lab))) %>%
+  group_by(What) %>%
+  summarise(Spots = n(), `Est. value left` = tt(sum(est_ev)), .groups = "drop") %>%
+  arrange(desc(as.numeric(gsub("[^0-9.-]", "", `Est. value left`))))
+knitr::kable(sm, align = "lrr", row.names = FALSE,
+             caption = "Where you left money by checking — ranked by rough estimated value")
+```
+
+```{r mo-note, results='asis', eval=!is.null(mo) && nrow(mo) > 0}
+val <- sum(mo$est_ev[grepl("value|monster", mo$type)])
+blf <- sum(mo$est_ev[grepl("bluff", mo$type)])
+cat(sprintf('<p class="meta"><b>The surprise: your bigger river leak is missed <i>value</i>, not missed bluffs.</b> Checked-down made hands account for ~%s of estimated lost value across %d spots, versus only ~%s of missed bluffs (%d spots). You check sets, two pair, even full houses to showdown. When you <i>do</i> bet the river it prints &mdash; you simply don&rsquo;t bet enough, with either your strong hands or your busted ones. Same passivity root, quantified from the other side. <i>(Value estimate is an upper bound &mdash; some checks are defensible on wet boards; the bluff figure is conservative, so the value&gt;bluff direction is the trustworthy part.)</i></p>',
+  tt(val), sum(grepl("value|monster", mo$type)), tt(blf), sum(grepl("bluff", mo$type))))
+```
+
+```{r mo-top, eval=!is.null(mo) && nrow(mo) > 0}
+top <- mo %>% arrange(desc(est_ev)) %>% head(15) %>%
+  transmute(Hand = hero_cards,
+            Board = paste(flop, turn_card, river_card),
+            Line = line, Spot = board,
+            What = mo_lab[type], `~$` = tt(est_ev), Date = substr(dt, 1, 10))
+knitr::kable(top, align = "lllllrr", row.names = FALSE,
+             caption = "Top 15 spots to replay (highest estimated value left)")
+```
+
+```{r mo-missing, results='asis', eval=is.null(mo) || nrow(mo) == 0}
+cat('<p class="meta">No <code>coinpoker_missed_ops.csv</code> found &mdash; run <code>Rscript missed_ops.R</code> (render does this automatically).</p>')
+```
+
+## Scorecard against benchmark ranges
+
+One place to see every key tendency against the band a winning 6-max reg lives in. "Read" just
+says where you sit relative to that band — **direction of "good" depends on the stat** (e.g. a
+lower fold-to-c-bet means you're stickier, not automatically better). Treat the small-denominator
+rows (3-bet, fold-to-3-bet) as directional until they fill in.
+
+```{r scorecard}
+pf  <- function(x) percent(x, 0.1)
+vp  <- mean(cash$vpip); pr <- mean(cash$pfr); gap <- vp - pr
+tb  <- sum(cash$three_bet)    / pmax(sum(cash$vsopen_opp), 1)
+f3  <- sum(cash$fold_to_3bet)  / pmax(sum(cash$ftb_opp),    1)
+cb  <- sum(cash$cbet_flop)     / pmax(sum(cash$cbet_opp),   1)
+fcb <- sum(cash$fold_to_cbet)  / pmax(sum(cash$fcbet_opp),  1)
+af  <- sum(cash$pf_aggr)       / pmax(sum(cash$pf_calls),   1)
+wtsd <- mean(cash$showdown[cash$saw_flop]); wsd <- mean(cash$net[cash$showdown] > 0)
+band <- function(x, lo, hi) ifelse(x < lo, "below band", ifelse(x > hi, "above band", "in band"))
+
+sc <- tibble::tribble(
+  ~Stat,           ~You,                       ~`Solid reg`, ~Read,
+  "VPIP",          pf(vp),                     "22-27%",     band(vp,  .22, .27),
+  "PFR",           pf(pr),                     "18-22%",     band(pr,  .18, .22),
+  "VPIP-PFR gap",  sprintf("%.1f pts", gap*100), "5-8 pts",  band(gap, .05, .08),
+  "3-bet",         pf(tb),                     "7-9%",       band(tb,  .07, .09),
+  "Fold to 3-bet", pf(f3),                     "40-55%",     band(f3,  .40, .55),
+  "C-bet flop",    pf(cb),                     "50-65%",     band(cb,  .50, .65),
+  "Fold to c-bet", pf(fcb),                    "45-55%",     band(fcb, .45, .55),
+  "Postflop AF",   sprintf("%.2f", af),        "2.0-3.0",    band(af,  2.0, 3.0),
+  "WTSD",          pf(wtsd),                   "24-28%",     band(wtsd,.24, .28),
+  "W$SD",          pf(wsd),                    "48-54%",     band(wsd, .48, .54))
+knitr::kable(sc, align = "lrcl")
+```
+
+> Read these together rather than one at a time. A wide VPIP-PFR gap, a high WTSD with a low W$SD and a
+> low postflop AF all point toward loose-passive play: calling too much preflop and calling down instead
+> of betting. The opposite pattern (tight preflop, high AF, low WTSD) points toward over-folding.
+
+## Rake & rakeback
+
+You generated **`r tt(tot_fees)`** in fees — **`r tt(tot_rake)`** rake plus **`r tt(tot_splash)`**
+in *splash fees* (a smaller house drop on nearly every pot, easy to overlook) — about
+**`r sprintf("%.1f", sum(h$fees/h$bb)/n_hands*100)` bb/100**. These are *contribution-weighted*
+(your share of each pot's drop), not whole-pot rake, so they reflect what you actually paid — and
+they're the presumed basis CoinPoker's rakeback pays against.
+
+```{r rake-by-stake}
+cash %>% group_by(Stake = stake) %>%
+  summarise(Hands = n(), Rake = tt(sum(hero_rake)), Splash = tt(sum(hero_splash)),
+            `Fees bb/100` = sprintf("%.1f", sum(fees / bb) / n() * 100),
+            `bb/100 before fees` = sprintf("%+.1f", sum((net + fees) / bb) / n() * 100),
+            `bb/100 after fees` = sprintf("%+.1f", sum(net_bb)/n()*100), .groups = "drop") %>%
+  knitr::kable(align = "lrrrrrr")
+```
+
+<p class="meta">Net per hand = collected − invested (top-offs/all-ins included), verified against stack
+deltas. Position from the button; blinds identified from posts. bb/100 normalizes by each hand's
+big blind.</p>
+
+### Rakeback, from the claim ledger
+
+Rakeback is claimed in lumps at irregular intervals. `rakeback_allocate.R` turns the claim ledger
+(`coinpoker_rakeback.csv`) into per-hand and per-stake numbers. Both wired into every render. DATA_DICTIONARY §16 has
+the full method and its caveats — the short version: **the total is exact** (real dollars you
+actually received), the **stake-level split is modeled** (an aggregate rate applied to each hand's
+own contributed fees, because the per-window implied rate is too noisy hand-claim to hand-claim to
+trust directly — that instability is shown, not hidden, below).
+
+```{r rb-load}
+rb_ledger <- tryCatch(read.csv("coinpoker_rakeback.csv", stringsAsFactors = FALSE), error = function(e) NULL)
+rb_stake <- tryCatch(read.csv("coinpoker_rakeback_by_stake.csv", stringsAsFactors = FALSE), error = function(e) NULL)
+rb_overall <- tryCatch(read.csv("coinpoker_rakeback_overall.csv", stringsAsFactors = FALSE), error = function(e) NULL)
+rb_windows <- tryCatch(read.csv("coinpoker_rakeback_windows.csv", stringsAsFactors = FALSE), error = function(e) NULL)
+rb_ok <- !is.null(rb_ledger) && !is.null(rb_stake) && !is.null(rb_overall)
+```
+
+```{r rb-kpi, results='asis', eval=rb_ok}
+cat(sprintf('<div class="kpi-row"><div class="kpi"><div class="kpi-label">Rakeback claimed</div><div class="kpi-value pos">%s</div><div class="kpi-sub">%d claims, %s &ndash; %s</div></div><div class="kpi"><div class="kpi-label">Net before &rarr; after</div><div class="kpi-value">%s &rarr; <span class="pos">%s</span></div><div class="kpi-sub">%+.1f &rarr; %+.1f bb/100</div></div><div class="kpi"><div class="kpi-label">Estimated still unclaimed</div><div class="kpi-value">%s</div><div class="kpi-sub">since your last claim, projected at the aggregate rate</div></div></div>',
+  tt(rb_overall$rakeback), nrow(rb_ledger), substr(min(rb_ledger$dt), 1, 10), substr(max(rb_ledger$dt), 1, 10),
+  tt(rb_overall$net_before), tt(rb_overall$net_after), rb_overall$bb100_before, rb_overall$bb100_after,
+  tt(rb_overall$unclaimed_est)))
+```
+
+```{r rb-by-stake, eval=rb_ok}
+rb_stake %>% transmute(Stake = stake, Hands = hands, Fees = tt(fees), Rakeback = tt(rakeback),
+  `Net before` = tt(net_before), `Net after` = tt(net_after),
+  `bb/100 before` = sprintf("%+.1f", bb100_before), `bb/100 after` = sprintf("%+.1f", bb100_after)) %>%
+  knitr::kable(align = "lrrrrrrr", caption = "Rakeback allocated by stake (modeled split, exact overall total)")
+```
+
+```{r rb-window-note, results='asis', eval=rb_ok && !is.null(rb_windows)}
+ir <- rb_windows$implied_rate[!is.na(rb_windows$implied_rate)]
+cat(sprintf('<p class="meta">Why a flat rate: the per-claim implied rate (claim $ &divide; fees generated since the previous claim) ranges from %.0f%% to %.0f%% across the %d windows &mdash; some windows have almost no fee volume, which makes their individual ratio meaningless. The aggregate rate (total claimed &divide; total fees across the whole claimed period) is far more stable and is what&rsquo;s used above; it still conserves the real total exactly, only the stake-by-stake split is estimated.</p>',
+  100 * min(ir), 100 * max(ir), nrow(rb_windows)))
+```
+
+```{r rb-missing, results='asis', eval=!rb_ok}
+cat('<p class="meta">No rakeback claim ledger found (<code>coinpoker_rakeback.csv</code>). <code>simulate_hands.py</code> writes a synthetic one.</p>')
+```
+
+# Methods & scope — what this analysis measures
+
+A map of the whole investigation: which streets, whose data, and what was measured, so the reads
+above are easy to place. Everything is parsed straight from the raw CoinPoker hand histories.
+
+### Data & trust
+- **`r comma(nrow(h))` hands**, `r format(min(as.Date(h$dt)), "%b %d")`–`r format(max(as.Date(h$dt)), "%b %d, %Y")`, mostly 6-max. Duplicate hands across overlapping exports are removed by hand id.
+- **Net** is rebuilt from Hero's own chips in/out and **reconciled to the next-hand stack delta**; mismatches are cash-outs/table-switches, not errors.
+- **Pot** is reconstructed action by action and checked against the hand-history total (`pot_unaccounted` in the parsed table); that check is what makes the pot-relative sizing trustworthy.
+- **Caveats**: postflop/showdown samples are small (read as *signals*, not proof); card-by-card analysis (draws, texture, sizing) uses **single-board hands** (run-it-twice excluded); win rates are **not yet statistically significant** at any stake; fees are **contribution-weighted** (your share of each pot's rake + splash).
+
+### By street
+- **Preflop** — VPIP, PFR, the VPIP–PFR gap, 3-bet, fold-to-3-bet, open-raise, all **by position**; starting-hand grid and card-luck.
+- **Flop** — c-bet and fold-to-c-bet (overall, by position, **by board texture**); the street funnel (how often you continue).
+- **Turn & river** — calls and call sizes, your own bets and bet sizes, showdown made-hands and what beat you.
+
+### Your data (Hero)
+Tendencies (VPIP/PFR/aggression/positional), starting-hand selection and P&L, postflop aggression
+(c-bet, AF, WWSF), made hands at showdown, **draws** (flush/straight, hit vs miss), **set-mining**,
+**river bet sizing** and the value/bluff mix behind it, and **recent form** (rolling, to catch course-corrections).
+
+### Opponent data (villains)
+Reconstructed from showdowns where they tabled a hand: **what beats you** (rank distribution of the
+hands you lose to) and **river sizing tells** — reading their bet size against the hand they showed,
+i.e. playing the hand backwards.
+
+### Ranges & hands
+The 13×13 starting-hand grid (your playing range), **card luck** (dealt vs combinatorially-expected
+frequencies, with a chi-square check), hand-group and specific-hand P&L, and the made-hand
+distribution at showdown.
+
+### Bluff vs. value
+Made-hand strength at showdown (yours and villains'), **busted draws taken to showdown**, and your
+**river bets split into value / one-pair / bluff** by size.
+
+### Sizing
+**Villain** river bets bucketed by share of pot vs. the hand they showed; **your** river calls
+bucketed pot-relative (where over-calling lives), and **your** river bets bucketed by size with
+fold-out rate, net, and the value/bluff mix behind each size.
+
+
+

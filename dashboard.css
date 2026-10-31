@@ -1,0 +1,92 @@
+body { color: #2b3a42; line-height: 1.55; }
+h1.title { font-weight: 700; }
+h2 { margin-top: 2.2em; padding-top: 0.3em; border-top: 1px solid #eef1f3; font-weight: 650; }
+h3 { color: #3a4a52; font-weight: 600; margin-top: 1.6em; }
+h4 { color: #6b7780; font-weight: 600; }
+
+.meta { color: #8a949c; font-size: 0.85em; }
+
+/* tables: lighter, roomier */
+table { border-collapse: collapse; }
+table th { border-bottom: 2px solid #e6e9ec; font-size: 0.82em; text-transform: uppercase;
+  letter-spacing: 0.03em; color: #6b7780; }
+table td, table th { padding: 5px 12px; }
+table tr:nth-child(even) { background: #fafbfc; }
+
+blockquote { border-left: 3px solid #1f4e79; background: #f4f7fa; color: #38454c;
+  padding: 8px 16px; margin: 14px 0; border-radius: 0 6px 6px 0; font-size: 0.95em; }
+
+/* callout boxes: warnings / ok / focus */
+.warn, .ok, .focus { border-radius: 10px; padding: 13px 18px; margin: 14px 0; font-size: 0.92em; }
+.warn { background: #f8f5f3; border: 1px solid #e2d7d1; }
+.warn-title { font-weight: 700; color: #8f3a29; text-transform: uppercase; letter-spacing: 0.05em;
+  font-size: 0.78em; margin-bottom: 4px; }
+.warn ul { margin: 4px 0 0; padding-left: 18px; }
+.warn li { margin: 2px 0; }
+.ok { background: #f4f7fa; border: 1px solid #d3dde8; color: #1f4e79; }
+.focus { background: #f3f7fb; border: 1px solid #cfddec; }
+.focus-title { font-weight: 700; color: #1f4e79; text-transform: uppercase; letter-spacing: 0.05em;
+  font-size: 0.78em; margin-bottom: 4px; }
+.focus-sub { color: #8a949c; font-size: 0.85em; margin-top: 6px; }
+
+.up { color: #1f4e79; font-weight: 600; }
+.down { color: #a8432f; font-weight: 600; }
+.muted { color: #b3bbc1; }
+
+/* playing-card chips */
+.card { display: inline-block; min-width: 20px; padding: 2px 5px; margin: 0 2px;
+  background: #fff; border: 1px solid #d7dde0; border-radius: 4px; font-weight: 700;
+  font-size: 0.95em; line-height: 1.1; box-shadow: 0 1px 1px rgba(0,0,0,0.04); }
+.card .suit { margin-left: 1px; }
+
+/* hand-review panels */
+.review-hand { border: 1px solid #e6e9ec; border-radius: 10px; padding: 12px 16px; margin: 10px 0;
+  background: #fff; }
+.rh-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+.rh-meta { color: #8a949c; font-size: 0.85em; }
+.rh-net { margin-left: auto; font-weight: 700; font-size: 1.05em; }
+.rh-net.pos { color: #1f4e79; } .rh-net.neg { color: #a8432f; }
+.rh-streets { display: flex; gap: 10px; flex-wrap: wrap; }
+.street { flex: 1 1 130px; background: #fafbfc; border: 1px solid #eef1f3; border-radius: 8px;
+  padding: 8px 10px; }
+.st-name { font-size: 0.7em; text-transform: uppercase; letter-spacing: 0.06em; color: #8a949c; }
+.st-cards { margin: 5px 0 4px; }
+.st-act { font-size: 0.85em; }
+.act-bet { color: #1f4e79; font-weight: 600; }
+.act-call { color: #9c7434; font-weight: 600; }
+.rh-foot { margin-top: 9px; padding-top: 8px; border-top: 1px dashed #e6e9ec;
+  font-size: 0.85em; color: #6b7780; }
+
+.kpi-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin: 22px 0 8px;
+}
+.kpi {
+  flex: 1 1 150px;
+  background: #fff;
+  border: 1px solid #e6e9ec;
+  border-radius: 10px;
+  padding: 16px 18px;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.03);
+}
+.kpi-label {
+  font-size: 0.72em;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #8a949c;
+}
+.kpi-value {
+  font-size: 1.7em;
+  font-weight: 700;
+  line-height: 1.25;
+  margin-top: 4px;
+}
+.kpi-value.pos { color: #1f4e79; }
+.kpi-value.neg { color: #a8432f; }
+.kpi-sub {
+  font-size: 0.8em;
+  color: #8a949c;
+  margin-top: 2px;
+}
