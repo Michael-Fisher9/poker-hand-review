@@ -51,12 +51,14 @@ Done -> coinpoker_dashboard.html
 
 `render_coinpoker.R` runs all of it and knits `coinpoker_dashboard.Rmd`.
 
+The pipeline is moving to Python a stage at a time. `parse_coinpoker.py` is done; a test checks it against the R parser column by column.
+
 ## Why it's built this way
 
 - **The parser is checked against the stack, not just itself.** Each hand's net plus any top-up should equal the stack at the next hand at the same table. That check runs on every parse and is printed with the totals.
-- **Synthetic hands with known answers.** `simulate_hands.py` plays each hand through PokerKit's engine with real cards, so pots, side pots, uncalled bets and showdowns are exact, then writes it in the export format. It also records Hero's true net, VPIP and flops seen, and the test suite checks that the R parser recovers all three on every hand, to the cent. Breaking the parser's handling of returned bets makes the test fail.
+- **Synthetic hands with known answers.** `simulate_hands.py` plays each hand through PokerKit's engine with real cards, so pots, side pots, uncalled bets and showdowns are exact, then writes it in the export format. It also records Hero's true net, VPIP and flops seen, and the test suite checks that the R parser recovers all three on every hand, to the cent.
 - **Planted leaks.** Hero's simulated strategy cold-calls too wide in position and folds too often to flop continuation bets. The dashboard should flag both, and it does: VPIP 27% against PFR 13%, button VPIP 45%, fold to c-bet 59%.
-- **Uncertainty on every headline number.** Win rates are reported with a posterior interval and a probability of being a long-run winner, because 10,000 hands is not enough to separate a small edge from noise. Per-bucket win rates are labelled as within-bucket rates.
+- **Uncertainty on every headline number.** Win rates are reported with a posterior interval and a probability of being a long-run winner, because 10,000 hands is not enough to separate a small edge from noise.
 - **Descriptions are computed, not typed.** Every sentence that states a result is generated from the data on the page, and the guidance beside each chart describes what to look for rather than what it found.
 - **The deepest drawdown is found, not chosen.** The luck ledger's window runs from the peak to the trough of the largest fall in cumulative net; `--window-start` and `--window-end` override it.
 - **The train/test split is by day.** The last 15% of hands, cut on a day boundary so hands from one session don't straddle it, are held out from the leak definitions.
